@@ -22,7 +22,8 @@
 | `import.rs` | Копия оригинала в `imports/` (правда) + `.meta.json`-сайдкар, нарезка чанков, индексация | `import_file`, `index_import`, `read_sidecar`/`is_sidecar`, `html_to_text`, `pdf_chunks` (за фичей) |
 | `export.rs` | Рендер md/json/jsonl (pdf за фичей) | `render`, `to_markdown` |
 | `output.rs` | Формирование JSON для вывода (lean-проекции `recall`/`related`) | `note_value`, `recall_value`, `RECALL_FIELDS`, `related_value`, `RELATED_FIELDS`, `round4`, `note_preview_value`, `split_tags`, `print_line` |
-| `init.rs` | Разворачивание папки памяти (`notes/` + `imports/` + `models/` + `.gitignore`), self-copy бинарника, печать указателя; опциональный bulk-импорт `.md` из target **рекурсивно** (вложенные папки тоже), с пропуском только что созданной папки памяти; **авто-привязка файлов-инструкций агента** (CLAUDE.md/AGENTS.md/AGENT.md/GEMINI.md/.cursorrules/.github/copilot-instructions.md) — дописывает в каждый найденный pointer-блок «бери доки через `cm recall`»: блока нет → дописать; есть идентичный → пропустить молча; есть устаревший (другой exe-путь при re-init с новым `--name`) → заменить блок на месте; файлы не создаёт | `run`, `import_existing_md`, `collect_md_files`/`walk_md`/`is_md`, `wire_entry_points`/`entry_point_block`/`replace_block` (+`ENTRY_POINT_NAMES`/`WIRE_BEGIN`/`WIRE_END`), `prompt_yes_no`/`is_yes`, `display_path` |
+| `init.rs` | Разворачивание папки памяти (`notes/` + `imports/` + `models/` + `.gitignore`), self-copy бинарника, печать указателя; опциональный bulk-импорт `.md` из target **рекурсивно** (вложенные папки тоже), с пропуском только что созданной папки памяти; **авто-привязка файлов-инструкций агента** (CLAUDE.md/AGENTS.md/AGENT.md/GEMINI.md/.cursorrules/.github/copilot-instructions.md) — дописывает в каждый найденный pointer-блок «бери доки через `cm recall`»: блока нет → дописать; есть идентичный → пропустить молча; есть устаревший (другой exe-путь при re-init с новым `--name`) → заменить блок на месте; файлы не создаёт. `pub(crate)`-помощники wiring переиспользует `deinit` | `run`, `import_existing_md`, `collect_md_files`/`walk_md`/`is_md`, `wire_entry_points`/`unwire_entry_points`/`entry_point_block`/`replace_block`/`strip_block` (+`ENTRY_POINT_NAMES`/`WIRE_BEGIN`/`WIRE_END`), `prompt_yes_no`/`is_yes`, `display_path` |
+| `deinit.rs` | Обратное к `init`: снимает **производные** следы cm из проекта, оставляя правду. Тот же `<target>` + `--name`, что и у init. Удаляет `store.db`(+`-wal`/`-shm`), `config.json`, `.gitignore`, `models/` и pointer-блоки из файлов-инструкций (`init::unwire_entry_points`); **сохраняет** `notes/*.md`+`imports/*` и копию `cm(.exe)` (запущенный exe сам себя на Windows не удалит). Пустую папку памяти сносит. Подтверждение y/N (как init), `--yes`/`--force` пропускает, piped stdin безопасно отказывает | `run`, `remove_if_empty`/`dir_is_empty` (+`DERIVED_FILES`/`DERIVED_DIRS`) |
 | `util.rs` | Самоисцеляющийся тип ошибки + UTC-время без зависимостей | `AppError` (+`with_hint`), `Result`, `now`, `iso_utc`, `civil_from_days`, `preview` |
 | `help.rs` | Контракт (текст help) + одностроковый указатель | `HELP`, `pointer` |
 
@@ -31,6 +32,7 @@
 `main` → `Parsed::parse(args)` → `run`:
 - `help`/нет команды → печать `help::HELP`;
 - `init` → `init::run` (не открывает существующий store);
+- `deinit` → `deinit::run` (тоже не открывает store — работает с ФС напрямую);
 - иначе → `resolve_dir` → `Ctx::new(dir)` → `dispatch` → `commands::*`.
 
 Ошибка любой команды печатается в stderr как `error: …` + (если есть) `пример:` с подсказкой

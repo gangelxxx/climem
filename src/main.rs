@@ -6,6 +6,7 @@ mod chunk;
 mod cli;
 mod commands;
 mod config;
+mod deinit;
 mod embed;
 mod export;
 mod graph;
@@ -48,6 +49,7 @@ fn run(p: &Parsed) -> Result<()> {
             Ok(())
         }
         "init" => init::run(p),
+        "deinit" => deinit::run(p),
         other => {
             let dir = resolve_dir(p)?;
             let ctx = Ctx::new(&dir);

@@ -213,7 +213,7 @@ fn import_existing_md(target: &Path, folder: &Path, cfg: &Config, store_path: &P
 /// learns to pull project docs through `cm recall` instead of reading them whole.
 /// Matched case-insensitively by the path's tail (so `.github/copilot-instructions.md`
 /// matches a nested file too). Keep in sync with help::HELP / README.
-const ENTRY_POINT_NAMES: &[&str] = &[
+pub(crate) const ENTRY_POINT_NAMES: &[&str] = &[
     "CLAUDE.md",
     "AGENTS.md",
     "AGENT.md",
@@ -223,9 +223,10 @@ const ENTRY_POINT_NAMES: &[&str] = &[
 ];
 
 /// Markers bracketing the block we append, so a re-run can detect "already wired"
-/// and skip it (idempotent), and a human can find/remove it by hand.
-const WIRE_BEGIN: &str = "<!-- BEGIN cm memory pointer -->";
-const WIRE_END: &str = "<!-- END cm memory pointer -->";
+/// and skip it (idempotent), and a human can find/remove it by hand. `deinit`
+/// strips exactly this region back out (init.rs::unwire_entry_points).
+pub(crate) const WIRE_BEGIN: &str = "<!-- BEGIN cm memory pointer -->";
+pub(crate) const WIRE_END: &str = "<!-- END cm memory pointer -->";
 
 /// Append (or refresh) a "use cm, not the raw doc" pointer in each entry-point file
 /// found under `target`. Best-effort and idempotent:
@@ -293,6 +294,67 @@ fn replace_block(text: &str, block: &str) -> Option<String> {
         return None; // already current
     }
     Some(format!("{}{}{}", &text[..begin], block, &text[end..]))
+}
+
+/// The reverse of wiring: strip the marker-bracketed block (and the blank line we
+/// used to separate it from prior content) back out of each entry-point file under
+/// `target`. Reused by `deinit` to leave the docs as the user had them. Returns the
+/// number of files actually changed. Best-effort: a file without the block, or one
+/// we can't read/write, is just skipped (write errors warn on stderr).
+pub(crate) fn unwire_entry_points(target: &Path) -> usize {
+    let mut changed = 0;
+    for rel in ENTRY_POINT_NAMES {
+        let path = rel
+            .split('/')
+            .fold(target.to_path_buf(), |p, seg| p.join(seg));
+        if !path.is_file() {
+            continue;
+        }
+        let existing = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("warning: не удалось прочитать {}: {e}", path.display());
+                continue;
+            }
+        };
+        let Some(stripped) = strip_block(&existing) else {
+            continue; // no block here — nothing to undo
+        };
+        match std::fs::write(&path, stripped) {
+            Ok(()) => {
+                changed += 1;
+                print_line(&json!({ "unwired": path.to_string_lossy() }));
+            }
+            Err(e) => eprintln!("warning: не удалось обновить {}: {e}", path.display()),
+        }
+    }
+    changed
+}
+
+/// Remove the first marker-bracketed block from `text`, plus the single blank-line
+/// separator that wiring inserted before it (so a once-wired file round-trips back
+/// to its original bytes). Returns `None` if there's no well-formed block. Mirrors
+/// the cut in `replace_block`, then trims one leading "\n\n"/"\n" the append added.
+fn strip_block(text: &str) -> Option<String> {
+    let begin = text.find(WIRE_BEGIN)?;
+    let end_rel = text[begin..].find(WIRE_END)?;
+    let end = begin + end_rel + WIRE_END.len();
+    let mut before = text[..begin].to_string();
+    let after = &text[end..];
+    // `wire_entry_points` appended "\n" + block + "\n" (with a "\n\n" separator when
+    // the file didn't end in a newline). Undo that: drop the trailing newline(s) we
+    // added before the block, and a single trailing newline after it.
+    while before.ends_with('\n') {
+        before.pop();
+    }
+    let after = after.strip_prefix('\n').unwrap_or(after);
+    // If there was real content before the block, restore its terminating newline.
+    let mut out = before;
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(after);
+    Some(out)
 }
 
 /// The marker-bracketed pointer block appended to an entry-point file. Russian, to
@@ -374,8 +436,9 @@ fn walk_md(dir: &Path, exclude: &Path, out: &mut Vec<PathBuf>) {
 
 /// Print `question` to stderr and read one line back from stdin. Returns `true`
 /// for a yes, and `false` for a no, EOF, or a read error, so piped/non-interactive
-/// use safely declines.
-fn prompt_yes_no(question: &str) -> bool {
+/// use safely declines. Shared with `deinit` (a destructive op needs the same
+/// guard).
+pub(crate) fn prompt_yes_no(question: &str) -> bool {
     use std::io::{BufRead, Write};
     eprint!("{question}");
     let _ = std::io::stderr().flush();
@@ -708,6 +771,55 @@ mod tests {
         assert!(out.contains(".memory2/cm.exe"));
         assert!(!out.contains(".memory/cm.exe")); // stale path gone
         assert!(out.starts_with("rules\n")); // original content preserved
+    }
+
+    #[test]
+    fn wire_then_unwire_roundtrips_to_original() {
+        let tmp = TempDir::new().unwrap();
+        let d = tmp.path();
+        // Cover both separator cases: file ending in a newline, and one that doesn't.
+        for original in ["rules\n", "no trailing newline"] {
+            std::fs::write(d.join("CLAUDE.md"), original).unwrap();
+            wire_entry_points(d, Path::new(".memory/cm.exe"));
+            let wired = std::fs::read_to_string(d.join("CLAUDE.md")).unwrap();
+            assert!(wired.contains(WIRE_BEGIN)); // it was wired
+            let changed = unwire_entry_points(d);
+            assert_eq!(changed, 1);
+            let back = std::fs::read_to_string(d.join("CLAUDE.md")).unwrap();
+            // A file with no trailing newline gets one back (we always terminate
+            // restored content); otherwise it's byte-identical.
+            let expected = if original.ends_with('\n') {
+                original.to_string()
+            } else {
+                format!("{original}\n")
+            };
+            assert_eq!(back, expected, "roundtrip failed for {original:?}");
+        }
+    }
+
+    #[test]
+    fn strip_block_handles_no_block_and_block_only_file() {
+        // No markers -> None (nothing to strip).
+        assert!(strip_block("just docs, no markers").is_none());
+        // A file that is ONLY the block (no prior content) strips to empty.
+        let only = format!("{WIRE_BEGIN}\nbody\n{WIRE_END}\n");
+        assert_eq!(strip_block(&only).unwrap(), "");
+        // Malformed (BEGIN without END) -> None, left alone.
+        assert!(strip_block(&format!("x\n{WIRE_BEGIN}\nno end")).is_none());
+    }
+
+    #[test]
+    fn unwire_entry_points_skips_files_without_block() {
+        let tmp = TempDir::new().unwrap();
+        let d = tmp.path();
+        std::fs::write(d.join("CLAUDE.md"), "plain rules, never wired\n").unwrap();
+        let changed = unwire_entry_points(d);
+        assert_eq!(changed, 0);
+        // Untouched.
+        assert_eq!(
+            std::fs::read_to_string(d.join("CLAUDE.md")).unwrap(),
+            "plain rules, never wired\n"
+        );
     }
 
     #[test]

@@ -36,6 +36,7 @@ WHICH COMMAND DO I USE? (pick by what you want to do)
   See what happened recently ..................... log
   Read or change settings ........................ config
   Set up a brand-new memory folder ............... init <path>
+  Remove cm's traces (keep your md) .............. deinit <path>
 
 ================================================================================
 HOW TO CALL IT
@@ -73,6 +74,21 @@ COMMANDS (full reference)
     stale one (e.g. a re-init under a new --name) is refreshed in place — never
     duplicated. init never creates a file that isn't already there.
     Example:  cm init ./project-memory --name project-memory
+
+  deinit  — remove cm's derived traces from a project (the reverse of init).
+  ------
+    cm deinit <path> [--name <name>] [--yes]
+    Use the SAME <path> and --name you gave init. Removes only the rebuildable
+    bits: store.db (+ -wal/-shm), config.json, the .gitignore init wrote, the
+    models/ weights, and the pointer blocks it appended to CLAUDE.md / AGENTS.md /
+    etc. It KEEPS your source of truth — notes/*.md and imports/* — and the cm
+    binary copy (delete that by hand; a running .exe can't remove itself on
+    Windows). If the folder ends up empty it is removed too.
+    Asks for confirmation first; --yes (or --force) skips the prompt. A piped/
+    non-interactive stdin declines safely (nothing is removed without a yes).
+    PRINTS: {"deinit":"<folder>","removed":[…],"unwired_files":N,
+             "folder_removed":bool}.
+    Example:  cm deinit ./project-memory --name project-memory --yes
 
   remember  — save one note. THE TEXT COMES FROM STDIN.
   --------
@@ -295,6 +311,7 @@ mod tests {
     fn help_const_mentions_all_commands() {
         for cmd in [
             "init",
+            "deinit",
             "remember",
             "recall",
             "get",

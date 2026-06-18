@@ -167,6 +167,7 @@ A note's **id is a short hex string** (e.g. `0a1b2c3d`) — and it's also the fi
 | Command | What it does |
 |---|---|
 | `cm init <path> [--name N] [--provider local\|api] [--model M] [--dimension D] [--endpoint U]` | Scaffold a self-contained memory folder (`notes/` + `imports/` + `store.db` + `config.json` + a copy of the binary). Won't touch an existing folder. |
+| `cm deinit <path> [--name N] [--yes]` | The reverse of `init`: remove cm's **derived** traces — `store.db`, `config.json`, the `.gitignore` it wrote, `models/`, and the pointer blocks in `CLAUDE.md`/`AGENTS.md`/… — while **keeping** `notes/` + `imports/` (your truth) and the binary copy. Asks first; `--yes` skips the prompt. Removes the folder if it ends up empty. |
 | `… \| cm remember [--tags a,b] [--source S] [--slug S] [--relations "p:t,p:t"]` | Write a note. Body from **stdin** → `notes/<id>.md`, then index. `--slug`/`--relations` feed the graph. Prints `{"id":"<hex>"}`. |
 | `cm recall "<query>" [--limit N] [--explain] [--fields …] [--tag T] [--origin-prefix F] [--min-score X] [--related <id>]` | Hybrid search (FTS5 + vector, plus optional graph proximity via `--related <id>`, fused via RRF). Returns lean JSONL sorted by relevance. `--related` is off unless `search.hybrid_weights.graph` is non-zero. |
 | `cm get <id>` | Fetch one record in full. |
@@ -307,7 +308,8 @@ src/
 ├── import.rs     — copy original into imports/ + sidecar, chunk it (+pdf behind a feature)
 ├── export.rs     — md / json / jsonl (+pdf behind a feature)
 ├── output.rs     — JSON shaping for output (recall/related get lean projections)
-└── init.rs       — scaffold the memory folder, self-copy the binary, print the pointer
+├── init.rs       — scaffold the memory folder, self-copy the binary, wire CLAUDE.md, print the pointer
+└── deinit.rs     — the reverse of init: strip derived traces, keep the md truth
 ```
 
 ---
