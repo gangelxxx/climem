@@ -60,6 +60,17 @@ pub struct Search {
     /// ranks, smaller sharpens it; 60 is the usual OpenSearch/TREC default. Plan R1.
     #[serde(default = "default_rrf_k")]
     pub rrf_k: usize,
+    /// How many graph hops the `recall --related <id>` proximity channel explores
+    /// (D8). Defaults to 2; `cm related` uses its own `--depth` (default 1). Kept
+    /// configurable so the recall channel's reach is no longer a silent hardcode.
+    #[serde(default = "default_graph_depth")]
+    pub graph_depth: usize,
+    /// Optional predicate filter for the `recall --related` graph channel (D9):
+    /// when set (and non-empty), the channel only follows edges with this
+    /// (normalized) predicate, mirroring `related --predicate`. Empty/absent =
+    /// follow every predicate.
+    #[serde(default)]
+    pub graph_predicate: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -124,6 +135,9 @@ fn default_candidates() -> usize {
 fn default_rrf_k() -> usize {
     60
 }
+fn default_graph_depth() -> usize {
+    2
+}
 fn half() -> f32 {
     0.5
 }
@@ -156,6 +170,8 @@ impl Default for Search {
             hybrid_weights: HybridWeights::default(),
             candidates: default_candidates(),
             rrf_k: default_rrf_k(),
+            graph_depth: default_graph_depth(),
+            graph_predicate: String::new(),
         }
     }
 }
@@ -310,6 +326,8 @@ mod tests {
 
         assert_eq!(c.search.candidates, 50);
         assert_eq!(c.search.rrf_k, 60);
+        assert_eq!(c.search.graph_depth, 2); // recall --related explores 2 hops
+        assert!(c.search.graph_predicate.is_empty()); // no predicate filter by default
         assert_eq!(c.chunking.max_tokens, 200);
         assert_eq!(c.chunking.overlap, 32);
         assert_eq!(c.version, 2);

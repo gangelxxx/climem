@@ -77,11 +77,7 @@ pub fn run(p: &Parsed) -> Result<()> {
     let _ = std::fs::write(folder.join(".gitignore"), gitignore);
 
     // Copy the running binary in too, so the whole memory folder travels together.
-    let exe_name = if cfg!(windows) {
-        "cm.exe"
-    } else {
-        "cm"
-    };
+    let exe_name = if cfg!(windows) { "cm.exe" } else { "cm" };
     let exe_dest = folder.join(exe_name);
     let self_exe = std::env::current_exe()?;
     if let Err(e) = std::fs::copy(&self_exe, &exe_dest) {
@@ -150,14 +146,20 @@ fn import_existing_md(target: &Path, folder: &Path, cfg: &Config, store_path: &P
     let emb = match embed::build(cfg) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("warning: не удалось собрать эмбеддер — импорт пропущен: {}", e.msg);
+            eprintln!(
+                "warning: не удалось собрать эмбеддер — импорт пропущен: {}",
+                e.msg
+            );
             return;
         }
     };
     let store = match Store::open(store_path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("warning: не удалось открыть хранилище — импорт пропущен: {}", e.msg);
+            eprintln!(
+                "warning: не удалось открыть хранилище — импорт пропущен: {}",
+                e.msg
+            );
             return;
         }
     };
@@ -182,7 +184,10 @@ fn import_existing_md(target: &Path, folder: &Path, cfg: &Config, store_path: &P
             }
         }
     }
-    let _ = store.log_op("init-import", Some(&format!("{} files", imported_paths.len())));
+    let _ = store.log_op(
+        "init-import",
+        Some(&format!("{} files", imported_paths.len())),
+    );
 
     if imported_paths.is_empty() {
         return;
@@ -295,7 +300,17 @@ mod tests {
 
     #[test]
     fn is_yes_accepts_affirmatives_case_and_bom_insensitive() {
-        for ok in ["y", "Y", "yes", "YES", "д", "да", "ДА", " y \n", "\u{feff}y"] {
+        for ok in [
+            "y",
+            "Y",
+            "yes",
+            "YES",
+            "д",
+            "да",
+            "ДА",
+            " y \n",
+            "\u{feff}y",
+        ] {
             assert!(is_yes(ok), "{ok:?} should be yes");
         }
         for no in ["", "n", "no", "нет", "x", "yep", "\u{feff}n", "ладно"] {
@@ -351,7 +366,10 @@ mod tests {
         // Sort order is by full path (deterministic): a parent dir's own files
         // come after its subdirectories' when those subdir names sort earlier.
         let paths = collect_md_files(d, &no_exclude());
-        assert!(paths.windows(2).all(|w| w[0] <= w[1]), "must be sorted by path");
+        assert!(
+            paths.windows(2).all(|w| w[0] <= w[1]),
+            "must be sorted by path"
+        );
     }
 
     #[test]

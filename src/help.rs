@@ -27,7 +27,8 @@ WHICH COMMAND DO I USE? (pick by what you want to do)
   I want to find notes about a topic ............. recall "<topic>"
   I have an id, give me the whole note ........... get <id>
   Show me the newest notes ....................... list
-  What notes link to this one? ................... related <id>
+  What does this note link to? ................... related <id>
+  What links TO this note? (backlinks) ........... backlinks <id>
   Delete a note .................................. forget <id>
   Load a whole document (md/txt/html/pdf) ........ import <file>
   Rebuild search after editing files by hand ..... reindex
@@ -99,7 +100,13 @@ COMMANDS (full reference)
     --tag T          only notes carrying tag T.
     --origin-prefix F  only chunks whose source file path starts with F.
     --min-score X    drop matches weaker than X (the scores are small numbers).
-    --related <id>   also favor notes near <id> in the graph (off by default).
+    --related <id>   also favor notes near <id> in the graph. OFF BY DEFAULT:
+                     it does nothing unless the graph channel has weight. Turn it
+                     on once with:
+                       cm config set search.hybrid_weights.graph 0.3
+                     How far it reaches (default 2 hops) and an optional predicate
+                     filter live in config too (search.graph_depth,
+                     search.graph_predicate).
     DEFAULT OUTPUT per line: {"id","kind","body"} plus tags/origin/source when
     the note has them. Empty fields are omitted to save space.
     Example:  cm recall "how does authentication work" --limit 5
@@ -128,6 +135,16 @@ COMMANDS (full reference)
     It has no id. It will resolve on its own once that note gets written and you
     run `reindex`.
     Example:  cm related 0a1b2c3d --depth 2
+
+  backlinks  — the reverse of related: which notes link TO this one.
+  ---------
+    cm backlinks <id> [--predicate P] [--limit N]
+    The graph is directed: `related <id>` shows what <id> points at; `backlinks
+    <id>` shows who points at <id>. One hop. Each line:
+      {"id","kind","predicate","preview"}.
+    --predicate P  only count links made with predicate P.
+    --limit N      max backlinks to return (default 5).
+    Example:  cm backlinks 0a1b2c3d
 
   forget  — delete one note (the file and its search entry).
   ------
@@ -178,7 +195,8 @@ COMMANDS (full reference)
     cm config get <key>                show one value.
     cm config set <key> <value>        change one value.
     Keys use dots, e.g.:  embedding.provider , embedding.model ,
-    embedding.endpoint , search.hybrid_weights.fts
+    embedding.endpoint , search.hybrid_weights.fts ,
+    search.hybrid_weights.graph , search.graph_depth , search.graph_predicate
     Example:  cm config set embedding.provider api
 
   help  — print this text.
@@ -196,7 +214,10 @@ THE KNOWLEDGE GRAPH (how notes link together)
   id: to point at an exact id, e.g. id:0a1b2c3d.
   If the target does not exist yet, the link is kept as "dangling" and starts
   working automatically once that note is written and you run `reindex`.
-  Walk these links with `cm related <id>`.
+  Links are DIRECTED (A -> B means "A points at B"). Walk them forward with
+  `cm related <id>`, and backward (who points at this note?) with
+  `cm backlinks <id>`. Deleting a note turns links that pointed at it back into
+  dangling ones (the link is still authored in the other note's md).
 
 ================================================================================
 EMBEDDINGS (how meaning-based search is computed; in config.json)
@@ -266,8 +287,19 @@ mod tests {
     #[test]
     fn help_const_mentions_all_commands() {
         for cmd in [
-            "init", "remember", "recall", "get", "list", "related", "forget", "import", "export",
-            "reindex", "log", "config",
+            "init",
+            "remember",
+            "recall",
+            "get",
+            "list",
+            "related",
+            "backlinks",
+            "forget",
+            "import",
+            "export",
+            "reindex",
+            "log",
+            "config",
         ] {
             assert!(HELP.contains(cmd), "HELP should mention `{cmd}`");
         }

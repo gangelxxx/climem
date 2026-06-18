@@ -159,10 +159,11 @@ A note's **id is a short hex string** (e.g. `0a1b2c3d`) — and it's also the fi
 |---|---|
 | `cm init <path> [--name N] [--provider local\|api] [--model M] [--dimension D] [--endpoint U]` | Scaffold a self-contained memory folder (`notes/` + `imports/` + `store.db` + `config.json` + a copy of the binary). Won't touch an existing folder. |
 | `… \| cm remember [--tags a,b] [--source S] [--slug S] [--relations "p:t,p:t"]` | Write a note. Body from **stdin** → `notes/<id>.md`, then index. `--slug`/`--relations` feed the graph. Prints `{"id":"<hex>"}`. |
-| `cm recall "<query>" [--limit N] [--explain] [--fields …] [--tag T] [--origin-prefix F] [--min-score X] [--related <id>]` | Hybrid search (FTS5 + vector, fused via RRF). Returns lean JSONL sorted by relevance. |
+| `cm recall "<query>" [--limit N] [--explain] [--fields …] [--tag T] [--origin-prefix F] [--min-score X] [--related <id>]` | Hybrid search (FTS5 + vector, plus optional graph proximity via `--related <id>`, fused via RRF). Returns lean JSONL sorted by relevance. `--related` is off unless `search.hybrid_weights.graph` is non-zero. |
 | `cm get <id>` | Fetch one record in full. |
 | `cm list [--recent N]` | List the most recent records (body shown as a preview). |
-| `cm related <id> [--depth D] [--predicate P] [--limit N] [--fields …]` | Graph neighbours (frontmatter `relations` + `[[wikilinks]]`). Dangling targets come back as `{"dangling":true,…}`. |
+| `cm related <id> [--depth D] [--predicate P] [--limit N] [--fields …]` | Graph neighbours this note points at (frontmatter `relations` + `[[wikilinks]]`). Dangling targets come back as `{"dangling":true,…}`. |
+| `cm backlinks <id> [--predicate P] [--limit N]` | The reverse of `related`: notes that point **at** `<id>` → `{"id","kind","predicate","preview"}`. |
 | `cm forget <id>` | Delete `notes/<id>.md` and its index row → `{"deleted":bool,"id":"<hex>"}`. (Imported chunks can't be deleted this way — edit `imports/` and `reindex`.) |
 | `cm import <file> [--tags a,b]` | Copy the original into `imports/`, split it into chunks, index them → `{"imported":"…","chunks":N}`. |
 | `cm reindex [--all]` | Rebuild `store.db` from `notes/` + `imports/`, incrementally (by content hash). `--all` forces a full re-embed → `{"indexed":N,"changed":M}`. |
@@ -198,16 +199,27 @@ The full record is always one `cm get <id>` away.
 
 ## The knowledge graph
 
-Notes can link to each other, and `cm related` walks those links.
+Notes link to each other, and the links are **directed**: `A → B` means "A points at B".
+`cm related <id>` walks them forward (what does this note point at?); `cm backlinks <id>`
+walks them backward (what points at this note?).
 
 - In a note's **frontmatter**: an optional `slug` (a human-friendly name others link to) and
   `relations` (a list of `predicate: target` edges).
-- In the **body**: `[[wikilinks]]`.
+- In the **body**: `[[wikilinks]]` (they get the synthetic predicate `links_to`).
 
 A link target is resolved by `slug`; prefix it with `id:` to address by id instead
-(`id:0a1b2c3d`). An unresolved target is kept as a first-class **dangling** edge — it comes to
-life automatically on the next `reindex`, once the target note exists. The graph itself is
-derived: it's stored in `store.db`, computed from the Markdown, and rebuilt by `reindex`.
+(`id:0a1b2c3d`). Predicates are normalized (`depends_on`, `depends-on`, `Depends On` all
+collapse to `depends_on`), so `--predicate` matching is forgiving. An unresolved target is kept
+as a first-class **dangling** edge — it comes to life automatically on the next `reindex`, once
+the target note exists, *even if the linking note itself never changed*. Symmetrically,
+deleting a note turns links that pointed at it back into dangling ones (the link is still
+authored in the other note's Markdown). The graph itself is derived: it's stored in `store.db`,
+computed from the Markdown, and rebuilt by `reindex`.
+
+**Graph-aware recall.** `cm recall "<q>" --related <id>` adds a third channel that favours notes
+near `<id>` in the graph. It's **off by default** — turn it on once with
+`cm config set search.hybrid_weights.graph 0.3`. Its reach (`search.graph_depth`, default 2
+hops) and an optional predicate filter (`search.graph_predicate`) live in config.
 
 ```markdown
 ---

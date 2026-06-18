@@ -177,6 +177,41 @@ pub fn remember(p: &Parsed, ctx: &Ctx) -> Result<()> {
             &content_hash_hex(md.as_bytes()),
             mtime_secs(&ctx.note_path(&id)),
         );
+        // Warn if this slug is already claimed by another note (B4). The resolver
+        // is lowest-id-wins (`build_slug_map` over `note_slugs ORDER BY id`), and
+        // note ids are RANDOM hex — so the freshly minted id may sort above OR
+        // below the existing claimant(s). We compute the actual winner (the lowest
+        // id among all claimants, this note included) so the message can't lie: it
+        // names which note links will resolve to, and flags when that isn't this
+        // one. We keep the lowest-id-wins behavior (an invariant) — just visible,
+        // the way reindex already does via `slug_collisions`.
+        if let Some(s) = slug {
+            let want = graph::normalize_slug(s);
+            if !want.is_empty() {
+                let others: Vec<String> = store
+                    .note_slugs()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|(other_id, other_slug)| {
+                        other_id != &id && graph::normalize_slug(other_slug) == want
+                    })
+                    .map(|(other_id, _)| other_id)
+                    .collect();
+                if !others.is_empty() {
+                    let winner = others.iter().chain(std::iter::once(&id)).min().unwrap();
+                    eprintln!(
+                        "warning: slug '{s}' is shared with note(s) {} — links to it resolve to \
+                         the lowest id '{winner}'{}.",
+                        others.join(", "),
+                        if winner == &id {
+                            " (this new note)"
+                        } else {
+                            ", not this new note"
+                        }
+                    );
+                }
+            }
+        }
         let _ = store.set_note_slug(&id, slug); // make this note linkable by slug right away
 
         // Derive the outgoing edges from --relations and the body's [[wiki-links]].
@@ -215,6 +250,17 @@ pub fn recall(p: &Parsed, ctx: &Ctx) -> Result<()> {
         min_score: parse_score(p.value("min-score"))?,
         related: p.value("related").filter(|s| !s.is_empty()),
     };
+
+    // Discoverability (D3): `--related` only does anything when the graph channel
+    // carries weight, and that weight is 0 by default. Rather than silently no-op,
+    // point the caller at the one config knob that turns it on.
+    if opts.related.is_some() && cfg.search.hybrid_weights.graph == 0.0 {
+        eprintln!(
+            "warning: --related is inert because search.hybrid_weights.graph is 0 (the graph \
+             channel is off by default). Turn it on with: \
+             cm config set search.hybrid_weights.graph 0.3"
+        );
+    }
 
     let emb = embed::build(&cfg)?;
     let hits = search::recall_with(&store, emb.as_ref(), &cfg, query, &opts)?;
@@ -268,97 +314,77 @@ pub fn list(p: &Parsed, ctx: &Ctx) -> Result<()> {
 pub fn related(p: &Parsed, ctx: &Ctx) -> Result<()> {
     let (store, _cfg) = ctx.open()?;
     let id = parse_id(p.arg(0)).map_err(|_| {
-        AppError::with_hint(
-            "related needs a note id",
-            "cm related 0a1b2c3d --depth 2",
-        )
+        AppError::with_hint("related needs a note id", "cm related 0a1b2c3d --depth 2")
     })?;
     let limit = parse_limit(p.value("limit"), 5)?;
     let depth = parse_limit(p.value("depth"), 1)?;
-    let predicate = p.value("predicate").filter(|s| !s.is_empty());
+    // Normalize the filter the same way edges store their predicate, so
+    // `--predicate depends-on` matches an edge derived from `Depends_On` (D5).
+    let predicate = p
+        .value("predicate")
+        .filter(|s| !s.is_empty())
+        .map(graph::normalize_predicate);
+
     let fields = match p.value("fields") {
         Some(s) if !s.is_empty() => Some(parse_fields(s, output::RELATED_FIELDS)?),
         _ => None,
     };
 
-    // BFS. `visited` is the set of resolved note ids we've already emitted (seeded
-    // with the start node, so a cycle or self-loop never re-emits it), and
-    // `seen_dangling` dedups the dangling targets. Each neighbor is a tuple
-    // (distance, predicate, flag, key, row, name) where flag 0 = resolved
-    // (key = id) sorts ahead of flag 1 = dangling (key = raw text).
-    let mut visited: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    visited.insert(id.clone());
-    let mut seen_dangling: std::collections::BTreeSet<(String, String)> =
-        std::collections::BTreeSet::new();
-    let mut results: Vec<(
-        usize,
-        String,
-        u8,
-        String,
-        Option<crate::store::NoteRow>,
-        String,
-    )> = Vec::new();
-    let mut frontier: Vec<String> = vec![id.clone()];
+    // The graph walk is the shared `bfs_neighbors` core (D1). `related` wants
+    // dangling targets in the output, and the nearest-win truncation happens here.
+    let mut neighbors = search::bfs_neighbors(&store, &id, depth, predicate.as_deref(), true)?;
+    neighbors.truncate(limit);
 
-    let mut dist = 1;
-    while dist <= depth && !frontier.is_empty() {
-        frontier.sort();
-        let mut next: Vec<String> = Vec::new();
-        for src in &frontier {
-            for e in store.edges_from(src)? {
-                if let Some(pred) = predicate {
-                    if e.predicate != pred {
-                        continue; // --predicate constrains every hop
-                    }
-                }
-                match e.dst_id {
-                    Some(did) => {
-                        if visited.contains(&did) {
-                            continue;
-                        }
-                        // Resolve to the live note; a stale edge (note gone) is skipped.
-                        if let Some(row) = store.get(&did)? {
-                            visited.insert(did.clone());
-                            next.push(did.clone());
-                            results.push((dist, e.predicate, 0, did, Some(row), String::new()));
-                        }
-                    }
-                    None => {
-                        let key = (e.predicate.clone(), e.dst_raw.clone());
-                        if seen_dangling.insert(key) {
-                            results.push((
-                                dist,
-                                e.predicate,
-                                1,
-                                e.dst_raw.clone(),
-                                None,
-                                e.dst_raw,
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-        frontier = next;
-        dist += 1;
-    }
-
-    results.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then(a.1.cmp(&b.1))
-            .then(a.2.cmp(&b.2))
-            .then(a.3.cmp(&b.3))
-    });
-    results.truncate(limit);
-
-    for (distance, pred, _flag, _key, row, name) in &results {
+    for n in &neighbors {
         print_line(&output::related_value(
-            row.as_ref(),
-            name,
-            pred,
-            *distance,
+            n.row.as_ref(),
+            &n.dst_raw,
+            &n.predicate,
+            n.distance,
             fields.as_deref(),
         ));
+    }
+    Ok(())
+}
+
+// ---- backlinks (inbound graph edges) -------------------------------------
+
+/// `backlinks <id>`: the inverse of `related` — which notes point AT this one.
+/// The graph is directed (`A → B` means "A depends on / links to B"), so this is
+/// the only way to walk it backwards (D6/D7). One hop only: each result is a note
+/// that authored an edge resolving to `<id>`, with the predicate it used. Output
+/// mirrors `related` minus `distance`/`dangling` (a backlink is always a resolved,
+/// one-hop inbound edge from a live note).
+pub fn backlinks(p: &Parsed, ctx: &Ctx) -> Result<()> {
+    let (store, _cfg) = ctx.open()?;
+    let id = parse_id(p.arg(0))
+        .map_err(|_| AppError::with_hint("backlinks needs a note id", "cm backlinks 0a1b2c3d"))?;
+    let limit = parse_limit(p.value("limit"), 5)?;
+    let predicate = p
+        .value("predicate")
+        .filter(|s| !s.is_empty())
+        .map(graph::normalize_predicate);
+
+    let mut printed = 0usize;
+    for e in store.edges_to(&id)? {
+        if printed >= limit {
+            break; // honor --limit 0 too (print nothing), like related/list
+        }
+        if let Some(pred) = &predicate {
+            if &e.predicate != pred {
+                continue;
+            }
+        }
+        // Only surface live sources (the source note still exists).
+        if let Some(row) = store.get(&e.src_id)? {
+            print_line(&json!({
+                "id": row.id,
+                "kind": row.kind,
+                "predicate": e.predicate,
+                "preview": preview(&row.body, 160),
+            }));
+            printed += 1;
+        }
     }
     Ok(())
 }
@@ -388,6 +414,7 @@ pub fn forget(p: &Parsed, ctx: &Ctx) -> Result<()> {
     }
     let had_row = store.forget(&id)?;
     store.delete_edges_from(&id)?; // drop the note's outgoing graph edges
+    store.dangle_edges_to(&id)?; // and re-dangle anyone who linked TO it (B2/B3)
     store.file_state_delete(&format!("notes/{id}.md"))?;
     store.log_op("forget", Some(&id))?;
     print_line(&json!({ "deleted": had_file || had_row, "id": id }));
@@ -476,8 +503,30 @@ pub fn reindex(p: &Parsed, ctx: &Ctx) -> Result<()> {
         );
     }
     let slug_map = graph::build_slug_map(&slugs);
+    let changed_ids: std::collections::HashSet<&str> =
+        changed_notes.iter().map(|(id, _)| id.as_str()).collect();
     for (id, note) in &changed_notes {
         index_note_edges(&store, id, note, &ids, &slug_map)?;
+    }
+
+    // Revive dangling edges (B1/L3): a forward reference authored earlier (its
+    // source note unchanged) may now resolve against a slug/id that appeared since
+    // — possibly written by `remember` itself, so the reindex sees 0 changed files
+    // yet the resolvable set has grown. So on every incremental run, re-derive the
+    // edges of each note that still owns a dangling edge. It's cheap and idempotent:
+    // with no dangling edges the source list is empty, and sources already re-derived
+    // in the loop above are skipped. (`--all` already (re)indexed every note's
+    // edges, so it needs no second look.) Reading the note's md is what lets us
+    // re-derive it without it having changed.
+    if !all {
+        for src in store.dangling_edge_sources()? {
+            if changed_ids.contains(src.as_str()) {
+                continue; // already re-derived in the loop above
+            }
+            if let Some(note) = read_note_md(ctx, &src) {
+                index_note_edges(&store, &src, &note, &ids, &slug_map)?;
+            }
+        }
     }
 
     store.log_op("reindex", Some(if all { "all" } else { "incremental" }))?;
@@ -560,6 +609,7 @@ fn reindex_notes(store: &Store, emb: Option<&dyn Embedder>, ctx: &Ctx) -> Result
         if row.kind == "note" && !ctx.note_path(&row.id).exists() {
             store.forget(&row.id)?;
             store.delete_edges_from(&row.id)?;
+            store.dangle_edges_to(&row.id)?; // re-dangle inbound edges (B2/B3)
             store.file_state_delete(&format!("notes/{}.md", row.id))?;
             changed += 1;
         }
@@ -638,6 +688,15 @@ fn embed_or_empty(emb: Option<&dyn Embedder>, text: &str) -> Result<Vec<f32>> {
 /// authored relation and body `[[wiki-link]]` target against the current note set
 /// (by slug by default, or by id when the target has an `id:` prefix). Anything
 /// that doesn't resolve is kept as a dangling edge.
+///
+/// We dedup on `(predicate, resolved-key)` before inserting (D4): two relations
+/// that name the same target with different spellings (`DB Schema` / `db-schema`)
+/// resolve to one id and must not become two edges. The DB primary key keys on the
+/// verbatim `dst_raw`, so it would let those through; this catch is upstream of it.
+/// The resolved-key is the note id when it resolves, else the normalized raw
+/// target (so two spellings of the same *dangling* target also collapse). We keep
+/// the first spelling seen for `dst_raw`, which is stable because `note_edges`
+/// yields relations in authored order, then wiki-links.
 fn index_note_edges(
     store: &Store,
     src_id: &str,
@@ -646,11 +705,27 @@ fn index_note_edges(
     slug_map: &std::collections::BTreeMap<String, String>,
 ) -> Result<()> {
     store.delete_edges_from(src_id)?;
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
     for (predicate, target, source) in graph::note_edges(note) {
         let dst_id = graph::resolve_target(&target, ids, slug_map);
+        let key = dst_id
+            .clone()
+            .unwrap_or_else(|| format!("raw:{}", graph::normalize_slug(&target)));
+        if !seen.insert((predicate.clone(), key)) {
+            continue; // same predicate + same resolved target, different spelling
+        }
         store.insert_edge(src_id, &predicate, dst_id.as_deref(), &target, source)?;
     }
     Ok(())
+}
+
+/// Read and parse a note's md (`notes/<id>.md`) straight off disk, best-effort.
+/// Used by reindex's dangling-revival pass to re-derive an *unchanged* note's
+/// edges. Returns `None` if the file is missing or unparseable (it just won't be
+/// revived this run — no worse than before).
+fn read_note_md(ctx: &Ctx, id: &str) -> Option<note::Note> {
+    let bytes = std::fs::read(ctx.note_path(id)).ok()?;
+    note::parse(&String::from_utf8_lossy(&bytes)).ok()
 }
 
 /// How many `*.md` files sit directly under `dir` (used by the reindex legacy guard).
@@ -733,10 +808,7 @@ pub fn config(p: &Parsed, ctx: &Ctx) -> Result<()> {
         }
         Some("get") => {
             let key = p.arg(1).ok_or_else(|| {
-                AppError::with_hint(
-                    "config get needs a key",
-                    "cm config get embedding.model",
-                )
+                AppError::with_hint("config get needs a key", "cm config get embedding.model")
             })?;
             let raw = config::load_raw(path)?;
             match config::get_path(&raw, key) {
@@ -1105,6 +1177,69 @@ mod tests {
         assert!(err.hint.is_some());
     }
 
+    #[test]
+    fn backlinks_lists_inbound_sources_and_filters_predicate() {
+        let (_d, ctx) = setup();
+        // A --depends_on--> C ; B --links_to--> C. backlinks C => {A, B}.
+        std::fs::write(
+            ctx.note_path("a00001"),
+            "---\nid: a00001\ncreated: t\nrelations:\n  - depends_on: gamma\n---\nbody a",
+        )
+        .unwrap();
+        std::fs::write(
+            ctx.note_path("b00002"),
+            "---\nid: b00002\ncreated: t\n---\nsee [[gamma]]",
+        )
+        .unwrap();
+        std::fs::write(
+            ctx.note_path("c00003"),
+            "---\nid: c00003\ncreated: t\nslug: gamma\n---\ngamma note",
+        )
+        .unwrap();
+        reindex(&parsed(&["reindex", "--all"]), &ctx).unwrap();
+
+        // Both inbound edges resolve to c00003.
+        let into_c = open_store(&ctx).edges_to("c00003").unwrap();
+        assert_eq!(into_c.len(), 2);
+        assert!(into_c.iter().any(|e| e.src_id == "a00001"));
+        assert!(into_c.iter().any(|e| e.src_id == "b00002"));
+
+        // The handler runs; predicate filter narrows to the depends_on source only.
+        assert!(backlinks(&parsed(&["backlinks", "c00003"]), &ctx).is_ok());
+        assert!(backlinks(
+            &parsed(&["backlinks", "c00003", "--predicate", "depends_on"]),
+            &ctx
+        )
+        .is_ok());
+        // Missing id errors with a hint.
+        let err = backlinks(&parsed(&["backlinks"]), &ctx).unwrap_err();
+        assert!(err.hint.is_some());
+    }
+
+    #[test]
+    fn related_predicate_filter_normalizes_separator() {
+        // `--predicate depends-on` must match an edge stored as `depends_on` (D5).
+        let (_d, ctx) = setup();
+        std::fs::write(
+            ctx.note_path("a00001"),
+            "---\nid: a00001\ncreated: t\nrelations:\n  - depends_on: gamma\n---\nbody",
+        )
+        .unwrap();
+        std::fs::write(
+            ctx.note_path("c00003"),
+            "---\nid: c00003\ncreated: t\nslug: gamma\n---\ngamma",
+        )
+        .unwrap();
+        reindex(&parsed(&["reindex", "--all"]), &ctx).unwrap();
+        // The edge predicate is normalized to `depends_on`; the hyphenated filter
+        // is normalized the same way, so the walk still finds c00003.
+        let neighbors =
+            search::bfs_neighbors(&open_store(&ctx), "a00001", 1, Some("depends_on"), true)
+                .unwrap();
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].row.as_ref().unwrap().id, "c00003");
+    }
+
     // ---- reindex --------------------------------------------------------
 
     #[test]
@@ -1234,6 +1369,90 @@ mod tests {
         assert_eq!(dangling.len(), 1);
         assert_eq!(dangling[0].dst_raw, "ghost");
         assert_eq!(dangling[0].predicate, "links_to");
+    }
+
+    #[test]
+    fn incremental_reindex_revives_dangling_edge_when_target_appears() {
+        // B1 regression: A links to slug `beta` (dangling); B with slug `beta` is
+        // written later; an INCREMENTAL reindex (no --all) must revive A's edge,
+        // even though A's md never changed.
+        let (_d, ctx) = setup();
+        std::fs::write(
+            ctx.note_path("a00001"),
+            "---\nid: a00001\ncreated: t\nrelations:\n  - depends_on: beta\n---\nbody",
+        )
+        .unwrap();
+        reindex(&parsed(&["reindex"]), &ctx).unwrap();
+        // A's edge dangles: no note owns slug `beta` yet.
+        let e = open_store(&ctx).edges_from("a00001").unwrap();
+        assert_eq!(e.len(), 1);
+        assert!(e[0].dst_id.is_none() && e[0].dst_raw == "beta");
+
+        // Now B appears with slug beta; A's md is untouched.
+        std::fs::write(
+            ctx.note_path("b00002"),
+            "---\nid: b00002\ncreated: t\nslug: beta\n---\nbeta note",
+        )
+        .unwrap();
+        reindex(&parsed(&["reindex"]), &ctx).unwrap();
+        // Revived WITHOUT --all: the edge now resolves to b00002.
+        let e2 = open_store(&ctx).edges_from("a00001").unwrap();
+        assert_eq!(e2[0].dst_id.as_deref(), Some("b00002"));
+    }
+
+    #[test]
+    fn forget_target_redangles_inbound_edge_not_drops_it() {
+        // B2/B3 regression: A --depends_on--> B (resolved). forget B. A's edge must
+        // re-dangle (still authored in A's md), not silently disappear or stay
+        // resolved to a dead row.
+        let (_d, ctx) = setup();
+        std::fs::write(
+            ctx.note_path("b00002"),
+            "---\nid: b00002\ncreated: t\nslug: beta\n---\nbeta",
+        )
+        .unwrap();
+        std::fs::write(
+            ctx.note_path("a00001"),
+            "---\nid: a00001\ncreated: t\nrelations:\n  - depends_on: beta\n---\nbody",
+        )
+        .unwrap();
+        reindex(&parsed(&["reindex", "--all"]), &ctx).unwrap();
+        assert_eq!(
+            open_store(&ctx).edges_from("a00001").unwrap()[0]
+                .dst_id
+                .as_deref(),
+            Some("b00002")
+        );
+
+        // Forget B: the inbound edge re-dangles (dst_id NULL), keeping its raw text.
+        forget(&parsed(&["forget", "b00002"]), &ctx).unwrap();
+        let e = open_store(&ctx).edges_from("a00001").unwrap();
+        assert_eq!(e.len(), 1);
+        assert!(e[0].dst_id.is_none());
+        assert_eq!(e[0].dst_raw, "beta");
+    }
+
+    #[test]
+    fn index_note_edges_dedups_same_target_different_spelling() {
+        // D4: a relation and a wiki-link naming the same slug two ways collapse to
+        // one edge per (predicate, resolved id). `links_to` here applies twice over
+        // `DB Schema` / `db-schema`, which resolve to the same note.
+        let (_d, ctx) = setup();
+        std::fs::write(
+            ctx.note_path("aa00ff"),
+            "---\nid: aa00ff\ncreated: t\n---\nsee [[DB Schema]] and again [[db-schema]]",
+        )
+        .unwrap();
+        std::fs::write(
+            ctx.note_path("zz99ee"),
+            "---\nid: zz99ee\ncreated: t\nslug: db-schema\n---\nthe schema",
+        )
+        .unwrap();
+        reindex(&parsed(&["reindex", "--all"]), &ctx).unwrap();
+        let edges = open_store(&ctx).edges_from("aa00ff").unwrap();
+        // Two spellings, one resolved edge.
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].dst_id.as_deref(), Some("zz99ee"));
     }
 
     #[test]

@@ -13,10 +13,120 @@
 
 use crate::config::Config;
 use crate::embed::{cosine, Embedder};
+use crate::graph;
 use crate::store::{NoteRow, Store};
 use crate::util::Result;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
+
+/// One neighbor surfaced by `bfs_neighbors`: how far it sits from the start, by
+/// which predicate we reached it, and either the live note it resolved to or
+/// (for a dangling target) its verbatim text. This is the raw traversal result;
+/// `related` and the recall graph channel each format it their own way.
+pub struct Neighbor {
+    pub distance: usize,
+    pub predicate: String,
+    /// `Some` = resolved to a live note; `None` = dangling (note not written yet).
+    pub row: Option<NoteRow>,
+    /// The verbatim md target (only meaningful when `row` is `None`).
+    pub dst_raw: String,
+}
+
+/// The one shared graph walk behind both `cm related` and `recall --related`
+/// (D1). A deterministic BFS out from `start` over the note's outgoing edges, up
+/// to `depth` hops. We seed `visited` with `start`, so a self-loop or cycle never
+/// re-emits a node. Every resolved edge is live-validated with `store.get` (D2):
+/// an edge whose target row is gone is skipped, so a stale `dst_id` can't leak
+/// into either caller. Results come back ordered by `(distance, predicate,
+/// resolved-before-dangling, key)` — the nearest, then a stable tie-break — so a
+/// caller can just `truncate` to a limit and get the nearest neighbors.
+///
+/// - `predicate`: when `Some`, only edges with this exact predicate are followed,
+///   at every hop (same per-hop semantics as `related --predicate`).
+/// - `include_dangling`: keep dangling targets in the output (`related` wants
+///   them; the recall channel, which can only rank real notes, does not).
+pub fn bfs_neighbors(
+    store: &Store,
+    start: &str,
+    depth: usize,
+    predicate: Option<&str>,
+    include_dangling: bool,
+) -> Result<Vec<Neighbor>> {
+    let mut visited: BTreeSet<String> = BTreeSet::new();
+    visited.insert(start.to_string());
+    let mut seen_dangling: BTreeSet<(String, String)> = BTreeSet::new();
+    // (distance, predicate, flag, key) keys the sort; flag 0 = resolved (key = id)
+    // sorts ahead of flag 1 = dangling (key = raw text).
+    let mut results: Vec<(usize, String, u8, String, Neighbor)> = Vec::new();
+    let mut frontier: Vec<String> = vec![start.to_string()];
+
+    let mut dist = 1;
+    while dist <= depth && !frontier.is_empty() {
+        frontier.sort();
+        let mut next: Vec<String> = Vec::new();
+        for src in &frontier {
+            for e in store.edges_from(src)? {
+                if let Some(p) = predicate {
+                    if e.predicate != p {
+                        continue; // --predicate constrains every hop
+                    }
+                }
+                match e.dst_id {
+                    Some(did) => {
+                        if visited.contains(&did) {
+                            continue;
+                        }
+                        // Live-validate: a stale edge (target row gone) is skipped.
+                        if let Some(row) = store.get(&did)? {
+                            visited.insert(did.clone());
+                            next.push(did.clone());
+                            results.push((
+                                dist,
+                                e.predicate.clone(),
+                                0,
+                                did,
+                                Neighbor {
+                                    distance: dist,
+                                    predicate: e.predicate,
+                                    row: Some(row),
+                                    dst_raw: String::new(),
+                                },
+                            ));
+                        }
+                    }
+                    None if include_dangling => {
+                        let key = (e.predicate.clone(), e.dst_raw.clone());
+                        if seen_dangling.insert(key) {
+                            results.push((
+                                dist,
+                                e.predicate.clone(),
+                                1,
+                                e.dst_raw.clone(),
+                                Neighbor {
+                                    distance: dist,
+                                    predicate: e.predicate,
+                                    row: None,
+                                    dst_raw: e.dst_raw,
+                                },
+                            ));
+                        }
+                    }
+                    None => {} // dangling, but this caller doesn't want them
+                }
+            }
+        }
+        frontier = next;
+        dist += 1;
+    }
+
+    results.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then(a.1.cmp(&b.1))
+            .then(a.2.cmp(&b.2))
+            .then(a.3.cmp(&b.3))
+    });
+    Ok(results.into_iter().map(|(_, _, _, _, n)| n).collect())
+}
 
 pub struct Hit {
     pub row: NoteRow,
@@ -136,8 +246,19 @@ pub fn recall_with(
     // empty unless you both pass a target AND give the graph channel a non-zero
     // weight, so an ordinary recall comes out byte-for-byte the same as before.
     // Anything that isn't a neighbor just contributes 0, same as any other miss.
+    // Depth and an optional predicate filter come from config (D8/D9).
+    let graph_pred = {
+        let p = graph::normalize_predicate(&cfg.search.graph_predicate);
+        if p.is_empty() {
+            None
+        } else {
+            Some(p)
+        }
+    };
     let graph_rank: HashMap<String, usize> = match opts.related {
-        Some(start) if wg != 0.0 => neighbor_ranks(store, start, 2)?,
+        Some(start) if wg != 0.0 => {
+            neighbor_ranks(store, start, cfg.search.graph_depth, graph_pred.as_deref())?
+        }
         _ => HashMap::new(),
     };
 
@@ -181,32 +302,29 @@ pub fn recall_with(
     Ok(out)
 }
 
-/// Rank notes by how far they sit from `start` in the graph: a BFS over resolved
-/// outgoing edges, up to `depth` hops, ordered by (distance, id). Returns a
-/// `id -> 1-based rank` map and leaves `start` itself out. It's deterministic
-/// (we sort the frontier each round, then sort the result).
-fn neighbor_ranks(store: &Store, start: &str, depth: usize) -> Result<HashMap<String, usize>> {
-    let mut visited: BTreeSet<String> = BTreeSet::new();
-    visited.insert(start.to_string());
-    let mut by_distance: Vec<(usize, String)> = Vec::new();
-    let mut frontier: Vec<String> = vec![start.to_string()];
-    let mut dist = 1;
-    while dist <= depth && !frontier.is_empty() {
-        frontier.sort();
-        let mut next: Vec<String> = Vec::new();
-        for src in &frontier {
-            for e in store.edges_from(src)? {
-                if let Some(did) = e.dst_id {
-                    if visited.insert(did.clone()) {
-                        next.push(did.clone());
-                        by_distance.push((dist, did));
-                    }
-                }
-            }
-        }
-        frontier = next;
-        dist += 1;
-    }
+/// Rank a note's resolved graph neighbors by proximity to `start`, as a `id ->
+/// 1-based rank` map (`start` itself excluded). This is the recall graph channel,
+/// now a thin wrapper over the shared `bfs_neighbors` (D1): we ask for resolved
+/// neighbors only (`include_dangling = false`, since the channel can only rank
+/// real notes) and live-validation comes for free, so a stale `dst_id` no longer
+/// leaks in (D2).
+///
+/// We re-sort the resolved neighbors by `(distance, id)` before numbering them.
+/// `bfs_neighbors` orders by `(distance, predicate, …, id)` — fine for `related`'s
+/// display, but the RECALL rank must stay keyed on `(distance, id)` exactly as the
+/// old standalone channel was, so the predicate of the reaching edge can't shuffle
+/// same-distance neighbors and silently shift their RRF scores.
+fn neighbor_ranks(
+    store: &Store,
+    start: &str,
+    depth: usize,
+    predicate: Option<&str>,
+) -> Result<HashMap<String, usize>> {
+    let mut by_distance: Vec<(usize, String)> =
+        bfs_neighbors(store, start, depth, predicate, false)?
+            .into_iter()
+            .filter_map(|n| n.row.map(|r| (n.distance, r.id)))
+            .collect();
     by_distance.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
     Ok(by_distance
         .into_iter()
@@ -685,6 +803,123 @@ mod tests {
         // Off by default (graph weight 0): related is inert, every graph == 0.
         let hits0 = recall_with(&store, &emb, &Config::default(), "zzz", &opts).unwrap();
         assert!(hits0.iter().all(|h| h.graph == 0.0));
+    }
+
+    #[test]
+    fn recall_graph_channel_respects_predicate_filter() {
+        // a --blocks--> b and a --links_to--> c. With graph_predicate = "blocks",
+        // only b is boosted (D9); c is ignored even though it's a neighbor.
+        let store = mem();
+        let a = store
+            .insert_note("alpha", "", None, None, "note", &[1.0, 0.0])
+            .unwrap();
+        let b = store
+            .insert_note("beta", "", None, None, "note", &[0.0, 1.0])
+            .unwrap();
+        let c = store
+            .insert_note("gamma", "", None, None, "note", &[0.0, 1.0])
+            .unwrap();
+        store
+            .insert_edge(&a, "blocks", Some(&b), &b, "relation")
+            .unwrap();
+        store
+            .insert_edge(&a, "links_to", Some(&c), &c, "wikilink")
+            .unwrap();
+        let emb = FakeEmbedder::new(2);
+        let opts = RecallOpts {
+            limit: 8,
+            related: Some(a.as_str()),
+            ..Default::default()
+        };
+        let mut cfg = cfg_weights(0.0, 0.0);
+        cfg.search.hybrid_weights.graph = 1.0;
+        cfg.search.graph_predicate = "blocks".into();
+        let hits = recall_with(&store, &emb, &cfg, "zzz", &opts).unwrap();
+        let hb = hits.iter().find(|h| h.row.id == b).unwrap();
+        let hc = hits.iter().find(|h| h.row.id == c).unwrap();
+        assert!(hb.graph > 0.0, "blocks-neighbor boosted");
+        assert_eq!(hc.graph, 0.0, "links_to-neighbor filtered out");
+    }
+
+    #[test]
+    fn recall_graph_channel_ranks_same_distance_by_id_not_predicate() {
+        // Two depth-1 neighbors of `a`, reached by predicates whose order DISAGREES
+        // with the id order. The graph rank (and thus the RRF boost) must follow
+        // (distance, id) — the lower id outranks — regardless of predicate. This
+        // pins the behavior the shared bfs_neighbors refactor must preserve.
+        let store = mem();
+        // Force ids so we know the id order: insert lower-id note first is not
+        // guaranteed (ids are minted), so drive edges with explicit ids.
+        let a = store
+            .insert_note("alpha", "", None, None, "note", &[0.0, 0.0])
+            .unwrap();
+        let lo = store
+            .insert_note("lo", "", None, None, "note", &[0.0, 0.0])
+            .unwrap();
+        let hi = store
+            .insert_note("hi", "", None, None, "note", &[0.0, 0.0])
+            .unwrap();
+        let (lo, hi) = if lo < hi { (lo, hi) } else { (hi, lo) };
+        // Reach the LOWER id via a predicate that sorts LATER ("zzz"), and the
+        // HIGHER id via one that sorts EARLIER ("aaa"): predicate order is the
+        // opposite of id order, so a predicate-first rank would invert them.
+        store
+            .insert_edge(&a, "zzz", Some(&lo), &lo, "relation")
+            .unwrap();
+        store
+            .insert_edge(&a, "aaa", Some(&hi), &hi, "relation")
+            .unwrap();
+        let emb = FakeEmbedder::new(2);
+        let opts = RecallOpts {
+            limit: 8,
+            related: Some(a.as_str()),
+            ..Default::default()
+        };
+        let mut cfg = cfg_weights(0.0, 0.0);
+        cfg.search.hybrid_weights.graph = 1.0;
+        let hits = recall_with(&store, &emb, &cfg, "zzz", &opts).unwrap();
+        let glo = hits.iter().find(|h| h.row.id == lo).unwrap().graph;
+        let ghi = hits.iter().find(|h| h.row.id == hi).unwrap().graph;
+        // Lower id ranks first → bigger graph contribution, even though its edge
+        // predicate ("zzz") sorts after the higher id's ("aaa").
+        assert!(glo > ghi, "same-distance rank follows id, not predicate");
+    }
+
+    #[test]
+    fn recall_graph_channel_depth_from_config() {
+        // a -> b -> c. graph_depth 1 reaches only b; depth 2 reaches c too (D8).
+        let store = mem();
+        let a = store
+            .insert_note("alpha", "", None, None, "note", &[0.0, 0.0])
+            .unwrap();
+        let b = store
+            .insert_note("beta", "", None, None, "note", &[0.0, 0.0])
+            .unwrap();
+        let c = store
+            .insert_note("gamma", "", None, None, "note", &[0.0, 0.0])
+            .unwrap();
+        store
+            .insert_edge(&a, "links_to", Some(&b), &b, "wikilink")
+            .unwrap();
+        store
+            .insert_edge(&b, "links_to", Some(&c), &c, "wikilink")
+            .unwrap();
+        let emb = FakeEmbedder::new(2);
+        let opts = RecallOpts {
+            limit: 8,
+            related: Some(a.as_str()),
+            ..Default::default()
+        };
+        let mut cfg = cfg_weights(0.0, 0.0);
+        cfg.search.hybrid_weights.graph = 1.0;
+
+        cfg.search.graph_depth = 1;
+        let h1 = recall_with(&store, &emb, &cfg, "zzz", &opts).unwrap();
+        assert!(h1.iter().find(|h| h.row.id == c).unwrap().graph == 0.0); // c out of reach
+
+        cfg.search.graph_depth = 2;
+        let h2 = recall_with(&store, &emb, &cfg, "zzz", &opts).unwrap();
+        assert!(h2.iter().find(|h| h.row.id == c).unwrap().graph > 0.0); // c now boosted
     }
 
     #[test]

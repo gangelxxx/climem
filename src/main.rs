@@ -70,6 +70,7 @@ fn dispatch(cmd: &str, p: &Parsed, ctx: &Ctx) -> Result<()> {
         "get" => commands::get(p, ctx),
         "list" => commands::list(p, ctx),
         "related" => commands::related(p, ctx),
+        "backlinks" => commands::backlinks(p, ctx),
         "forget" => commands::forget(p, ctx),
         "import" => commands::import(p, ctx),
         "export" => commands::export(p, ctx),

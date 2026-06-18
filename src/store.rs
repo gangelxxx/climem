@@ -566,6 +566,36 @@ impl Store {
         Ok(())
     }
 
+    /// Edges that point AT `dst_id` — the inbound, backlink direction (D6/D7). The
+    /// graph is otherwise strictly one-way (`edges_from` walks `src_id`), so this
+    /// is the only way to ask "who links to this note?". Uses the `edges_dst`
+    /// index. Ordered for deterministic output.
+    pub fn edges_to(&self, dst_id: &str) -> Result<Vec<EdgeRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT src_id, predicate, dst_id, dst_raw, source FROM edges
+             WHERE dst_id = ?1 ORDER BY src_id, predicate, source",
+        )?;
+        let rows = stmt
+            .query_map(params![dst_id], map_edge)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Distinct source ids that currently own at least one dangling edge
+    /// (`dst_id IS NULL`). Incremental `reindex` uses this to re-resolve forward
+    /// references: when a fresh slug/id appears, the notes that were left dangling
+    /// on it get their edges re-derived even though their own md never changed
+    /// (closes B1/L3). Ordered for deterministic processing.
+    pub fn dangling_edge_sources(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT src_id FROM edges WHERE dst_id IS NULL ORDER BY src_id")?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// A note's outgoing edges (both resolved and dangling), in a fixed order.
     pub fn edges_from(&self, src_id: &str) -> Result<Vec<EdgeRow>> {
         let mut stmt = self.conn.prepare(
@@ -583,6 +613,21 @@ impl Store {
         self.conn
             .execute("DELETE FROM edges WHERE src_id = ?1", params![src_id])?;
         Ok(())
+    }
+
+    /// When a note is removed (forgotten or pruned), turn every edge that pointed
+    /// AT it back into a dangling one (`dst_id = NULL`), leaving `dst_raw` — the
+    /// verbatim md target — intact. This keeps the graph honest: the link is still
+    /// authored in the source note's md, so it must re-dangle (and spring back to
+    /// life if a note with that slug/id reappears), not silently vanish or stay
+    /// resolved to a dead row. Closes B2/B3 (orphaned resolved edges). Returns how
+    /// many edges were re-dangled. Uses the `edges_dst` index.
+    pub fn dangle_edges_to(&self, dst_id: &str) -> Result<usize> {
+        let n = self.conn.execute(
+            "UPDATE edges SET dst_id = NULL WHERE dst_id = ?1",
+            params![dst_id],
+        )?;
+        Ok(n)
     }
 
     // ---- derived-wipe (reindex --all) ------------------------------------
@@ -1015,6 +1060,61 @@ mod tests {
         // Re-deriving a note's edges: drop then reinsert.
         s.delete_edges_from("a").unwrap();
         assert!(s.edges_from("a").unwrap().is_empty());
+    }
+
+    #[test]
+    fn edges_to_returns_only_inbound_resolved_edges() {
+        let s = mem();
+        s.insert_edge("a", "links_to", Some("b"), "beta", "wikilink")
+            .unwrap();
+        s.insert_edge("c", "depends_on", Some("b"), "b-slug", "relation")
+            .unwrap();
+        s.insert_edge("a", "links_to", None, "ghost", "wikilink")
+            .unwrap(); // dangling, not inbound to b
+        let into_b = s.edges_to("b").unwrap();
+        assert_eq!(into_b.len(), 2);
+        // Ordered by (src_id, predicate, source): a < c.
+        assert_eq!(into_b[0].src_id, "a");
+        assert_eq!(into_b[1].src_id, "c");
+        assert!(s.edges_to("zzz").unwrap().is_empty());
+    }
+
+    #[test]
+    fn dangling_edge_sources_lists_distinct_sources_with_null_dst() {
+        let s = mem();
+        s.insert_edge("a", "links_to", None, "ghost", "wikilink")
+            .unwrap();
+        s.insert_edge("a", "depends_on", None, "spectre", "relation")
+            .unwrap(); // same source, two dangling
+        s.insert_edge("c", "links_to", None, "phantom", "wikilink")
+            .unwrap();
+        s.insert_edge("d", "links_to", Some("a"), "a-slug", "wikilink")
+            .unwrap(); // resolved -> not a source
+        assert_eq!(s.dangling_edge_sources().unwrap(), vec!["a", "c"]);
+    }
+
+    #[test]
+    fn dangle_edges_to_renulls_inbound_keeps_raw_and_outbound() {
+        let s = mem();
+        // a -> b (resolved), c -> b (resolved), b -> d (outbound, unrelated).
+        s.insert_edge("a", "links_to", Some("b"), "beta", "wikilink")
+            .unwrap();
+        s.insert_edge("c", "depends_on", Some("b"), "b-slug", "relation")
+            .unwrap();
+        s.insert_edge("b", "links_to", Some("d"), "delta", "wikilink")
+            .unwrap();
+
+        // Forgetting b re-dangles the two edges pointing AT it (returns the count).
+        assert_eq!(s.dangle_edges_to("b").unwrap(), 2);
+
+        let from_a = s.edges_from("a").unwrap();
+        assert_eq!(from_a[0].dst_id, None); // re-dangled...
+        assert_eq!(from_a[0].dst_raw, "beta"); // ...but the verbatim target survives
+        let from_c = s.edges_from("c").unwrap();
+        assert_eq!(from_c[0].dst_id, None);
+        assert_eq!(from_c[0].dst_raw, "b-slug");
+        // b's own OUTBOUND edge is untouched (only inbound re-dangle).
+        assert_eq!(s.edges_from("b").unwrap()[0].dst_id.as_deref(), Some("d"));
     }
 
     #[test]
