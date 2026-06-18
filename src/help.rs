@@ -65,6 +65,13 @@ COMMANDS (full reference)
       {"status":"already_exists"}.
     If <path> (or any subfolder) already holds .md files, init offers (y/N) to
     import the whole tree at once, then to delete the originals.
+    It also wires up the agent's instruction files if any are present
+    (CLAUDE.md, AGENTS.md, AGENT.md, GEMINI.md, .cursorrules,
+    .github/copilot-instructions.md): a short pointer block is APPENDED to each,
+    telling the model to fetch project docs via `cm recall` instead of reading
+    them whole. Re-running is safe: an identical block is left untouched, and a
+    stale one (e.g. a re-init under a new --name) is refreshed in place — never
+    duplicated. init never creates a file that isn't already there.
     Example:  cm init ./project-memory --name project-memory
 
   remember  — save one note. THE TEXT COMES FROM STDIN.

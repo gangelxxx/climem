@@ -48,13 +48,6 @@ fn run(p: &Parsed) -> Result<()> {
             Ok(())
         }
         "init" => init::run(p),
-        "mcp" => {
-            // Optional transport (desc.md §9); we don't ship it in this build.
-            eprintln!(
-                "MCP stdio mode is not built into this version. Use the CLI contract (`cm help`)."
-            );
-            std::process::exit(2);
-        }
         other => {
             let dir = resolve_dir(p)?;
             let ctx = Ctx::new(&dir);

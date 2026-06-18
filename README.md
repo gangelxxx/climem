@@ -138,6 +138,15 @@ prompt or `CLAUDE.md` so the model knows the tool exists and calls `recall` befo
 > tree is absorbed. The freshly-created memory folder itself is skipped, so its `imports/` copies
 > aren't re-ingested.
 
+> **Auto-wiring agent instructions:** `init` also looks for an agent's instruction files in the
+> target — `CLAUDE.md`, `AGENTS.md`, `AGENT.md`, `GEMINI.md`, `.cursorrules`,
+> `.github/copilot-instructions.md` — and **appends** a small pointer block to each one it finds,
+> telling the model to reach for project docs via `cm recall` rather than reading them whole. The
+> block is bracketed by `<!-- BEGIN cm memory pointer -->` markers, so re-running is safe: an
+> identical block is left untouched, while a stale one (e.g. you re-`init` under a different
+> `--name`, so the path to the binary changed) is **refreshed in place** — never duplicated. It's
+> easy to remove by hand. `init` never creates these files, only edits ones that already exist.
+
 ---
 
 ## Two things to keep in mind
@@ -317,6 +326,46 @@ A few load-bearing choices, in case you extend it:
   so the caller fixes itself in one step.
 - **A lean dependency tree** — heavy features (`api`, `pdf`) are opt-in behind cargo features
   and fail with a clear "rebuild with `--features …`" message when absent.
+
+---
+
+## How climem compares
+
+"Markdown memory for AI agents" is a real and crowded space now. climem isn't the only
+take on it — here's where it sits relative to the closest tools, so you can pick honestly.
+
+| | climem | [Engram](https://github.com/Gentleman-Programming/engram) | [basic-memory](https://github.com/basicmachines-co/basic-memory) | [memweave](https://github.com/sachinsharma9780/memweave) |
+|---|---|---|---|---|
+| **Form factor** | single Rust binary | single Go binary | Python app | Python library |
+| **Transport** | **CLI only** | CLI + HTTP + MCP + TUI | MCP-first (+CLI/HTTP) | embedded in your code |
+| **Search** | **FTS5 + vector (hybrid)** | FTS5 only | FTS5 + vector (hybrid) | BM25 + vector (hybrid) |
+| **Offline embeddings** | **built-in (char-3gram hash)** | n/a (no vectors) | yes (FastEmbed) | needs an embedder |
+| **Source of truth** | **Markdown files** | the database | Markdown files | Markdown files |
+| **DB is disposable** | **yes (`reindex` rebuilds)** | no (DB is canonical) | index is derived | index is derived |
+| **Knowledge graph** | yes (`relations` + `[[links]]`) | no | yes (typed relations) | no |
+| **Doc import / chunking** | yes (md/txt/html/pdf) | JSON import only | — | — |
+
+What makes climem its own point in this space:
+
+- **CLI-only, on purpose.** No MCP, no daemon, no HTTP server. Every command is a fresh
+  short-lived process the agent calls like any other shell tool. This sidesteps MCP's
+  cross-client instability and needs nothing more than a shell — see the rationale in
+  [desc.md §11](desc.md).
+- **Hybrid search with a zero-download offline embedder.** Engram is keyword-only;
+  basic-memory and memweave have vectors but pull in a neural embedder. climem ships a
+  deterministic char-3gram embedder that needs no model and no network, and its character
+  grams handle **inflected languages** (e.g. Russian) that bare FTS5 stemming misses.
+- **Markdown is the truth, the DB is a cache.** Same stance as basic-memory/memweave, the
+  opposite of Engram (where the SQLite DB is canonical). Delete `store.db`, run `reindex`,
+  nothing is lost.
+- **Smallest footprint.** One static binary, no Python/Node runtime, no server to keep
+  alive — the whole memory folder is self-contained and git-friendly.
+
+Where the others are ahead: basic-memory has native **Obsidian** sync and a more mature
+typed-graph model; Engram offers more **transports** out of the box (HTTP/MCP/TUI);
+memweave adds **temporal decay** and **MMR re-ranking** for result diversity. If you want
+those today, they're the better pick — climem trades them for being the minimal, runtime-free
+CLI option.
 
 ---
 

@@ -100,6 +100,12 @@ pub fn run(p: &Parsed) -> Result<()> {
     // `init ./`, and gets a one-shot bulk import + optional cleanup.
     import_existing_md(Path::new(target), &folder, &cfg, &store_path);
 
+    // Wire the agent's existing instruction files (CLAUDE.md, AGENTS.md, …) to the
+    // store: append a pointer telling the model to reach for these docs via `cm
+    // recall` instead of reading them whole. Idempotent — re-running init won't
+    // duplicate the block.
+    wire_entry_points(Path::new(target), &exe_dest);
+
     let exe_display = display_path(&exe_dest);
     println!(
         "{}",
@@ -200,6 +206,112 @@ fn import_existing_md(target: &Path, folder: &Path, cfg: &Config, store_path: &P
             }
         }
     }
+}
+
+/// File names we treat as an agent's "entry-point" instruction docs — the ones a
+/// model reads at the start of a session. We append a pointer to each so the model
+/// learns to pull project docs through `cm recall` instead of reading them whole.
+/// Matched case-insensitively by the path's tail (so `.github/copilot-instructions.md`
+/// matches a nested file too). Keep in sync with help::HELP / README.
+const ENTRY_POINT_NAMES: &[&str] = &[
+    "CLAUDE.md",
+    "AGENTS.md",
+    "AGENT.md",
+    "GEMINI.md",
+    ".cursorrules",
+    ".github/copilot-instructions.md",
+];
+
+/// Markers bracketing the block we append, so a re-run can detect "already wired"
+/// and skip it (idempotent), and a human can find/remove it by hand.
+const WIRE_BEGIN: &str = "<!-- BEGIN cm memory pointer -->";
+const WIRE_END: &str = "<!-- END cm memory pointer -->";
+
+/// Append (or refresh) a "use cm, not the raw doc" pointer in each entry-point file
+/// found under `target`. Best-effort and idempotent:
+///   * no block yet     -> append it after the existing content;
+///   * block already there, identical -> leave the file untouched (no output);
+///   * block already there but stale (different exe path, e.g. a re-init under a new
+///     `--name`) -> replace just the bracketed block in place.
+///
+/// We never create these files, only edit ones that already exist; any I/O error is
+/// a non-fatal stderr warning.
+fn wire_entry_points(target: &Path, exe_dest: &Path) {
+    let exe_display = display_path(exe_dest);
+    let block = entry_point_block(&exe_display);
+    for rel in ENTRY_POINT_NAMES {
+        // Split on '/' so a nested name like `.github/copilot-instructions.md`
+        // resolves under `target` on any platform (PathBuf joins per-component).
+        let path = rel
+            .split('/')
+            .fold(target.to_path_buf(), |p, seg| p.join(seg));
+        if !path.is_file() {
+            continue;
+        }
+        let existing = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("warning: не удалось прочитать {}: {e}", path.display());
+                continue;
+            }
+        };
+
+        let updated = match replace_block(&existing, &block) {
+            // A block is present. `None` means it's already current -> skip silently.
+            Some(replaced) => replaced,
+            None if existing.contains(WIRE_BEGIN) => continue,
+            // No block yet: append after the content, separated by a blank line
+            // (one extra '\n' if the file doesn't already end in a newline).
+            None => {
+                let sep = if existing.is_empty() || existing.ends_with('\n') {
+                    "\n"
+                } else {
+                    "\n\n"
+                };
+                format!("{existing}{sep}{block}\n")
+            }
+        };
+
+        match std::fs::write(&path, updated) {
+            Ok(()) => print_line(&json!({ "wired": path.to_string_lossy() })),
+            Err(e) => eprintln!("warning: не удалось дописать {}: {e}", path.display()),
+        }
+    }
+}
+
+/// If `text` already carries a marker-bracketed block AND it differs from `block`,
+/// return `text` with that region swapped for `block` (stale pointer self-heals on
+/// a re-init under a new path). Returns `None` when there's no block, or when the
+/// existing one is already identical (nothing to do). Only the FIRST block is
+/// touched; a malformed region (BEGIN without a following END) is left alone.
+fn replace_block(text: &str, block: &str) -> Option<String> {
+    let begin = text.find(WIRE_BEGIN)?;
+    // END must come after BEGIN; include the marker itself in the cut.
+    let end_rel = text[begin..].find(WIRE_END)?;
+    let end = begin + end_rel + WIRE_END.len();
+    if text[begin..end] == *block {
+        return None; // already current
+    }
+    Some(format!("{}{}{}", &text[..begin], block, &text[end..]))
+}
+
+/// The marker-bracketed pointer block appended to an entry-point file. Russian, to
+/// match the human-facing pointer in help::pointer; instructs the agent to reach
+/// for project docs via `cm recall` rather than reading them directly.
+fn entry_point_block(exe_display: &str) -> String {
+    format!(
+        "{begin}\n\
+         ## Память проекта через `{exe}`\n\n\
+         Документация и заметки проекта теперь живут в инструменте памяти `{exe}`, а не в\n\
+         этих файлах напрямую. Перед ответом по проекту сперва ищи контекст:\n\
+         `{exe} recall \"<тема>\"`. После значимых решений сохраняй их: `{exe} remember`\n\
+         (тело через stdin). Не перечитывай большие доки целиком — доставай релевантный срез\n\
+         через recall. Полный контракт: `{exe} help`.\n\
+         {end}",
+        begin = WIRE_BEGIN,
+        end = WIRE_END,
+        exe = exe_display,
+    )
 }
 
 /// Recursively collect the Markdown files under `dir` (sorted), skipping `exclude`
@@ -529,6 +641,114 @@ mod tests {
         assert_eq!(cfg.name, "m");
         assert_eq!(cfg.embedding.model, "custom-model");
         assert_eq!(cfg.embedding.dimension, 256);
+    }
+
+    // ---- entry-point wiring -------------------------------------------
+
+    #[test]
+    fn wire_entry_points_appends_block_to_known_files_only() {
+        let tmp = TempDir::new().unwrap();
+        let d = tmp.path();
+        // Two known entry points (one lowercase-ish via case-exact name) and a
+        // nested one, plus an unrelated file that must be left alone.
+        std::fs::write(d.join("CLAUDE.md"), "existing rules\n").unwrap();
+        std::fs::write(d.join("AGENTS.md"), "agent rules").unwrap(); // no trailing newline
+        std::fs::create_dir_all(d.join(".github")).unwrap();
+        std::fs::write(d.join(".github").join("copilot-instructions.md"), "copilot").unwrap();
+        std::fs::write(d.join("README.md"), "just a readme\n").unwrap(); // NOT an entry point
+
+        wire_entry_points(d, Path::new("cm.exe"));
+
+        let claude = std::fs::read_to_string(d.join("CLAUDE.md")).unwrap();
+        assert!(claude.starts_with("existing rules\n")); // original kept
+        assert!(claude.contains(WIRE_BEGIN) && claude.contains(WIRE_END));
+        assert!(claude.contains("recall") && claude.contains("remember"));
+
+        // No trailing newline original still gets a clean blank-line separation.
+        let agents = std::fs::read_to_string(d.join("AGENTS.md")).unwrap();
+        assert!(agents.starts_with("agent rules\n\n"));
+        assert!(agents.contains(WIRE_BEGIN));
+
+        let copilot =
+            std::fs::read_to_string(d.join(".github").join("copilot-instructions.md")).unwrap();
+        assert!(copilot.contains(WIRE_BEGIN)); // nested path wired
+
+        let readme = std::fs::read_to_string(d.join("README.md")).unwrap();
+        assert!(!readme.contains(WIRE_BEGIN)); // untouched
+    }
+
+    #[test]
+    fn wire_entry_points_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let d = tmp.path();
+        std::fs::write(d.join("CLAUDE.md"), "rules\n").unwrap();
+        wire_entry_points(d, Path::new("cm.exe"));
+        let once = std::fs::read_to_string(d.join("CLAUDE.md")).unwrap();
+        // Same exe path twice -> second run is a byte-for-byte no-op: exactly one
+        // block, content unchanged (no extra append, no rewrite).
+        wire_entry_points(d, Path::new("cm.exe"));
+        let twice = std::fs::read_to_string(d.join("CLAUDE.md")).unwrap();
+        assert_eq!(once, twice);
+        assert_eq!(twice.matches(WIRE_BEGIN).count(), 1);
+    }
+
+    #[test]
+    fn wire_entry_points_refreshes_stale_path_in_place() {
+        let tmp = TempDir::new().unwrap();
+        let d = tmp.path();
+        std::fs::write(d.join("CLAUDE.md"), "rules\n").unwrap();
+        // First init under one name, then a re-init that lands the binary elsewhere
+        // (the "init with a different --name" case).
+        wire_entry_points(d, Path::new(".memory/cm.exe"));
+        wire_entry_points(d, Path::new(".memory2/cm.exe"));
+        let out = std::fs::read_to_string(d.join("CLAUDE.md")).unwrap();
+        // Still exactly one block, but it now points at the NEW path, not the old.
+        assert_eq!(out.matches(WIRE_BEGIN).count(), 1);
+        assert_eq!(out.matches(WIRE_END).count(), 1);
+        assert!(out.contains(".memory2/cm.exe"));
+        assert!(!out.contains(".memory/cm.exe")); // stale path gone
+        assert!(out.starts_with("rules\n")); // original content preserved
+    }
+
+    #[test]
+    fn replace_block_swaps_only_when_different() {
+        let old = entry_point_block("OLD/cm.exe");
+        let new = entry_point_block("NEW/cm.exe");
+        let text = format!("intro\n\n{old}\ntail\n");
+        // Different block -> region swapped, surrounding text kept verbatim.
+        let got = replace_block(&text, &new).expect("should replace");
+        assert!(got.contains("NEW/cm.exe") && !got.contains("OLD/cm.exe"));
+        assert!(got.starts_with("intro\n\n") && got.ends_with("\ntail\n"));
+        // Identical block -> None (nothing to do).
+        assert!(replace_block(&got, &new).is_none());
+        // No block at all -> None.
+        assert!(replace_block("just text, no markers", &new).is_none());
+        // Malformed (BEGIN without END) -> left alone (None).
+        let malformed = format!("x\n{WIRE_BEGIN}\nbody but no end");
+        assert!(replace_block(&malformed, &new).is_none());
+    }
+
+    #[test]
+    fn wire_entry_points_never_creates_missing_files() {
+        let tmp = TempDir::new().unwrap();
+        let d = tmp.path();
+        // No entry-point files exist; wiring must not create any.
+        wire_entry_points(d, Path::new("cm.exe"));
+        assert!(!d.join("CLAUDE.md").exists());
+        assert!(!d.join("AGENTS.md").exists());
+    }
+
+    #[test]
+    fn init_wires_existing_claude_md() {
+        let tmp = TempDir::new().unwrap();
+        // A CLAUDE.md sitting in the target before init runs.
+        std::fs::write(tmp.path().join("CLAUDE.md"), "project rules\n").unwrap();
+        let (res, _) = run_init(&tmp, &["--name", "m"]);
+        res.unwrap();
+        let claude = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
+        assert!(claude.starts_with("project rules\n"));
+        assert!(claude.contains(WIRE_BEGIN));
+        assert!(claude.contains("recall"));
     }
 
     #[cfg(feature = "api")]
