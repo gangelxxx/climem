@@ -197,13 +197,14 @@ fn import_existing_md(target: &Path, folder: &Path, cfg: &Config, store_path: &P
     }
 }
 
-/// Recursively collect the Markdown files under `dir` (sorted), skipping anything
-/// inside `exclude` — the memory folder we just scaffolded, whose imports/ copies
-/// would otherwise get re-absorbed when `dir` is the same place (e.g. `init ./`).
-/// We match `.md`/`.markdown` case-insensitively, the exact same set `import`
-/// treats as Markdown, so a `README.MD` can't get skipped here while import would
-/// happily have taken it. No `walkdir` dependency: a small hand-rolled walk keeps
-/// the dependency tree minimal (CLAUDE.md).
+/// Recursively collect the Markdown files under `dir` (sorted), skipping `exclude`
+/// (the folder we just scaffolded) and ANY other climem memory folder we run into.
+/// Without that, an `init` next to an earlier memory folder would re-absorb its
+/// `imports/` copies (and a re-run would loop self-import). We match
+/// `.md`/`.markdown` case-insensitively, the exact same set `import` treats as
+/// Markdown, so a `README.MD` can't get skipped here while import would happily
+/// have taken it. No `walkdir` dependency: a small hand-rolled walk keeps the
+/// dependency tree minimal (CLAUDE.md).
 fn collect_md_files(dir: &Path, exclude: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     walk_md(dir, exclude, &mut paths);
@@ -221,9 +222,18 @@ fn is_md(p: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// True if `dir` looks like a climem memory folder — it holds both the derived
+/// index (`store.db`) and the config (`config.json`), the pair `init::run` lays
+/// down. We prune these wholesale so their `imports/` copies (and `notes/`) never
+/// get re-ingested as if they were user docs.
+fn is_memory_folder(dir: &Path) -> bool {
+    dir.join("store.db").is_file() && dir.join("config.json").is_file()
+}
+
 /// One directory level of the walk: append its `.md` files, then recurse into its
-/// subdirectories (depth-first). The `exclude` folder is pruned wholesale. Any
-/// unreadable entry is silently skipped — collection is best-effort.
+/// subdirectories (depth-first). The freshly-scaffolded `exclude` folder and any
+/// other memory folder are pruned wholesale. Any unreadable entry is silently
+/// skipped — collection is best-effort.
 fn walk_md(dir: &Path, exclude: &Path, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
@@ -232,9 +242,10 @@ fn walk_md(dir: &Path, exclude: &Path, out: &mut Vec<PathBuf>) {
         let path = entry.path();
         let Ok(ft) = entry.file_type() else { continue };
         if ft.is_dir() {
-            // Prune the scaffolded memory folder; don't follow symlinked dirs
-            // (could loop or escape the docs tree).
-            if path == exclude {
+            // Prune our own scaffold and any sibling memory folder; don't follow
+            // symlinked dirs (file_type() reflects the link, so is_dir() is false
+            // for them — guards against loops / escaping the docs tree).
+            if path == exclude || is_memory_folder(&path) {
                 continue;
             }
             walk_md(&path, exclude, out);
@@ -358,6 +369,39 @@ mod tests {
             .collect();
         // The memory folder's import copies are NOT re-absorbed.
         assert_eq!(got, vec!["doc.md"]);
+    }
+
+    #[test]
+    fn collect_md_files_prunes_any_memory_folder_not_just_exclude() {
+        // The bug a live test caught: `init` next to an EARLIER memory folder
+        // (different name, so not `exclude`) re-absorbed its imports/ copies.
+        // A memory folder is recognized by its store.db + config.json marker.
+        let tmp = TempDir::new().unwrap();
+        let d = tmp.path();
+        std::fs::write(d.join("real.md"), "x").unwrap();
+
+        // A pre-existing memory folder with a different name than `exclude`.
+        let old = d.join(".oldmem");
+        std::fs::create_dir_all(old.join("imports")).unwrap();
+        std::fs::write(old.join("store.db"), "").unwrap(); // marker
+        std::fs::write(old.join("config.json"), "{}").unwrap(); // marker
+        std::fs::write(old.join("imports").join("absorbed.md"), "x").unwrap();
+
+        // A look-alike that is NOT a memory folder (only config.json, no store.db):
+        // its .md must still be collected.
+        let notmem = d.join("docs");
+        std::fs::create_dir_all(&notmem).unwrap();
+        std::fs::write(notmem.join("config.json"), "{}").unwrap();
+        std::fs::write(notmem.join("guide.md"), "x").unwrap();
+
+        let exclude = d.join(".newmem"); // doesn't exist yet; irrelevant here
+        let mut got: Vec<String> = collect_md_files(d, &exclude)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        got.sort();
+        // .oldmem pruned (absorbed.md gone); real.md and docs/guide.md kept.
+        assert_eq!(got, vec!["guide.md", "real.md"]);
     }
 
     #[test]
