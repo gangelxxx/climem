@@ -132,9 +132,11 @@ cm export md --out memory-dump.md
 prompt or `CLAUDE.md` so the model knows the tool exists and calls `recall` before answering /
 `remember` after decisions.
 
-> **Folder-of-docs shortcut:** if the target directory already contains `.md` files, `init`
-> offers (y/N) to import them all at once, then offers to delete the originals (copies stay in
-> `imports/`). Put `cm` next to a pile of docs, run `cm init ./`, and they're absorbed.
+> **Folder-of-docs shortcut:** if the target directory (or any subfolder, recursively) contains
+> `.md` files, `init` offers (y/N) to import them all at once, then offers to delete the originals
+> (copies stay in `imports/`). Put `cm` next to a pile of docs, run `cm init ./`, and the whole
+> tree is absorbed. The freshly-created memory folder itself is skipped, so its `imports/` copies
+> aren't re-ingested.
 
 ---
 

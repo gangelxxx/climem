@@ -131,14 +131,17 @@ pub fn run(p: &Parsed) -> Result<()> {
 /// failed is never deleted. If stdin isn't readable (piped or non-interactive
 /// use) we just quietly skip the whole thing.
 fn import_existing_md(target: &Path, folder: &Path, cfg: &Config, store_path: &Path) {
-    let md_files = collect_md_files(target);
+    // Recurse the docs tree, but never descend into the memory folder we just laid
+    // out under `target` (when target is `./`, `folder` lives inside it): its
+    // notes/ + imports/ originals aren't user docs to re-absorb.
+    let md_files = collect_md_files(target, folder);
     if md_files.is_empty() {
         return;
     }
 
     eprintln!();
     if !prompt_yes_no(&format!(
-        "Найдено {} .md файлов в папке. Импортировать все? [y/N]: ",
+        "Найдено {} .md файлов (включая вложенные папки). Импортировать все? [y/N]: ",
         md_files.len()
     )) {
         return;
@@ -194,29 +197,51 @@ fn import_existing_md(target: &Path, folder: &Path, cfg: &Config, store_path: &P
     }
 }
 
-/// Collect the Markdown files sitting directly in `dir` (non-recursive, sorted).
+/// Recursively collect the Markdown files under `dir` (sorted), skipping anything
+/// inside `exclude` — the memory folder we just scaffolded, whose imports/ copies
+/// would otherwise get re-absorbed when `dir` is the same place (e.g. `init ./`).
 /// We match `.md`/`.markdown` case-insensitively, the exact same set `import`
 /// treats as Markdown, so a `README.MD` can't get skipped here while import would
-/// happily have taken it.
-fn collect_md_files(dir: &Path) -> Vec<PathBuf> {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let is_md = |p: &Path| {
-        p.extension()
-            .and_then(|x| x.to_str())
-            .map(|x| {
-                let x = x.to_lowercase();
-                x == "md" || x == "markdown"
-            })
-            .unwrap_or(false)
-    };
-    let mut paths: Vec<PathBuf> = rd
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.is_file() && is_md(p))
-        .collect();
+/// happily have taken it. No `walkdir` dependency: a small hand-rolled walk keeps
+/// the dependency tree minimal (CLAUDE.md).
+fn collect_md_files(dir: &Path, exclude: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    walk_md(dir, exclude, &mut paths);
     paths.sort();
     paths
+}
+
+fn is_md(p: &Path) -> bool {
+    p.extension()
+        .and_then(|x| x.to_str())
+        .map(|x| {
+            let x = x.to_lowercase();
+            x == "md" || x == "markdown"
+        })
+        .unwrap_or(false)
+}
+
+/// One directory level of the walk: append its `.md` files, then recurse into its
+/// subdirectories (depth-first). The `exclude` folder is pruned wholesale. Any
+/// unreadable entry is silently skipped — collection is best-effort.
+fn walk_md(dir: &Path, exclude: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            // Prune the scaffolded memory folder; don't follow symlinked dirs
+            // (could loop or escape the docs tree).
+            if path == exclude {
+                continue;
+            }
+            walk_md(&path, exclude, out);
+        } else if ft.is_file() && is_md(&path) {
+            out.push(path);
+        }
+    }
 }
 
 /// Print `question` to stderr and read one line back from stdin. Returns `true`
@@ -267,6 +292,11 @@ mod tests {
         }
     }
 
+    /// A path that can't exist inside the test dir, so nothing is excluded.
+    fn no_exclude() -> PathBuf {
+        Path::new("/__no_such_exclude__").to_path_buf()
+    }
+
     #[test]
     fn collect_md_files_filters_sorts_and_ignores_non_md() {
         let tmp = TempDir::new().unwrap();
@@ -276,18 +306,63 @@ mod tests {
         std::fs::write(d.join("notes.txt"), "x").unwrap(); // wrong extension
         std::fs::write(d.join("C.MD"), "x").unwrap(); // uppercase ext: accepted
         std::fs::write(d.join("doc.markdown"), "x").unwrap(); // .markdown: accepted
-        std::fs::create_dir(d.join("sub.md")).unwrap(); // a dir named *.md: excluded
-        let got: Vec<String> = collect_md_files(d)
+        std::fs::create_dir(d.join("sub.md")).unwrap(); // a dir named *.md: not a file
+        let got: Vec<String> = collect_md_files(d, &no_exclude())
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
-        // Only files, sorted; case-insensitive ext, .markdown included.
+        // Only files, sorted; case-insensitive ext, .markdown included. The dir
+        // named *.md isn't a file, and being empty it contributes nothing.
         assert_eq!(got, vec!["C.MD", "a.md", "b.md", "doc.markdown"]);
     }
 
     #[test]
+    fn collect_md_files_recurses_into_subdirs() {
+        let tmp = TempDir::new().unwrap();
+        let d = tmp.path();
+        std::fs::write(d.join("top.md"), "x").unwrap();
+        let sub = d.join("guide");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("nested.md"), "x").unwrap();
+        std::fs::write(sub.join("skip.txt"), "x").unwrap(); // wrong ext, even nested
+        let deep = sub.join("deeper");
+        std::fs::create_dir(&deep).unwrap();
+        std::fs::write(deep.join("way-down.md"), "x").unwrap();
+        // File names found, regardless of order — proves the recursion pulls in
+        // nested .md files and skips the nested .txt.
+        let mut names: Vec<String> = collect_md_files(d, &no_exclude())
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["nested.md", "top.md", "way-down.md"]);
+
+        // Sort order is by full path (deterministic): a parent dir's own files
+        // come after its subdirectories' when those subdir names sort earlier.
+        let paths = collect_md_files(d, &no_exclude());
+        assert!(paths.windows(2).all(|w| w[0] <= w[1]), "must be sorted by path");
+    }
+
+    #[test]
+    fn collect_md_files_prunes_excluded_folder() {
+        let tmp = TempDir::new().unwrap();
+        let d = tmp.path();
+        std::fs::write(d.join("doc.md"), "x").unwrap();
+        // Simulate the scaffolded memory folder sitting inside the docs dir.
+        let mem = d.join(".memory");
+        std::fs::create_dir_all(mem.join("imports")).unwrap();
+        std::fs::write(mem.join("imports").join("copy.md"), "x").unwrap();
+        let got: Vec<String> = collect_md_files(d, &mem)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        // The memory folder's import copies are NOT re-absorbed.
+        assert_eq!(got, vec!["doc.md"]);
+    }
+
+    #[test]
     fn collect_md_files_missing_dir_is_empty() {
-        assert!(collect_md_files(Path::new("/no/such/dir/here")).is_empty());
+        assert!(collect_md_files(Path::new("/no/such/dir/here"), &no_exclude()).is_empty());
     }
 
     /// Build init args targeting `tmp`, returning the produced folder path too.

@@ -1,119 +1,240 @@
 //! `help`: the contract lives right here inside the binary (desc.md §7). We update
 //! it in lockstep with the behavior, so it can't drift the way a separate doc would.
 
-pub const HELP: &str = r#"cm — активная память: короткоживущий CLI над хранилищем с поиском и графом.
+pub const HELP: &str = r#"cm — a memory tool for an AI agent. It stores notes on disk and searches them.
 
-ИДЕЯ
-  Источник правды — md-файлы: notes/<id>.md (по файлу на заметку) + imports/
-  (оригиналы импортов). store.db — ПРОИЗВОДНЫЙ, пересобираемый индекс (FTS5 +
-  векторы + граф знаний). Заметки человекочитаемы и git-дружелюбны; БД одноразова —
-  удали её и собери заново через `cm reindex` (потерять память через сбой БД нельзя).
+================================================================================
+READ THIS FIRST (the 6 rules that matter most)
+================================================================================
+1. WRITE the note text on STDIN, never as an argument.
+     RIGHT:  echo "your text here" | cm remember
+     WRONG:  cm remember "your text here"     <- this fails, text is ignored.
+2. Each command PRINTS one JSON object per line (this format is called JSONL).
+   Read that JSON to get the result. Parse it; do not guess.
+3. A note's id is a short hex string like 0a1b2c3d (only 0-9 and a-f).
+   The same id is the file name: notes/0a1b2c3d.md.
+4. To SAVE a fact, use `remember`. To FIND a fact, use `recall`. That is the
+   main loop: recall before you answer, remember after you decide something.
+5. If a command fails, it prints `error: ...` and one correct example to stderr.
+   Read the example, copy its shape, run again. One fix is usually enough.
+6. Run any command with no setup? No. First run `cm init <path>` ONCE to create
+   the memory folder. After that all other commands work.
 
-ВЫЗОВ
-  Стиль подкоманд:        cm <команда> [аргументы]
-  Windows-стиль флага:    cm /recall "тема"      (ведущий / = подкоманда)
-  Тело заметки — ВСЕГДА через stdin, не аргументом (снимает экранирование кавычек).
-  Вывод — построчный JSON (JSONL): удобно парсить и цеплять.
-  id заметки — короткий hex (например 0a1b2c3d), он же имя файла notes/<id>.md.
-  Любая ошибка печатает короткую подсказку с верным примером — чинишься за шаг.
+================================================================================
+WHICH COMMAND DO I USE? (pick by what you want to do)
+================================================================================
+  I want to save a fact / decision ............... remember   (text on stdin)
+  I want to find notes about a topic ............. recall "<topic>"
+  I have an id, give me the whole note ........... get <id>
+  Show me the newest notes ....................... list
+  What notes link to this one? ................... related <id>
+  Delete a note .................................. forget <id>
+  Load a whole document (md/txt/html/pdf) ........ import <file>
+  Rebuild search after editing files by hand ..... reindex
+  Save/print a backup of everything .............. export <format>
+  See what happened recently ..................... log
+  Read or change settings ........................ config
+  Set up a brand-new memory folder ............... init <path>
 
-ГДЕ ХРАНИЛИЩЕ
-  Папка памяти рядом с бинарником: cm + notes/ + imports/ + store.db + config.json.
-  Коммить notes/ + imports/ (правда); store.db можно игнорировать (производное).
-  Переопределить расположение: флаг --dir <путь> или переменная окружения MEMORY_DIR.
+================================================================================
+HOW TO CALL IT
+================================================================================
+  Normal style:    cm <command> [arguments]      e.g.  cm recall "auth"
+  Windows style:   cm /recall "auth"             (a leading / also works)
+  Both styles are equal. Use whichever you like.
 
-КОМАНДЫ
-  cm init <путь> [--name <имя>] [--model M] [--provider local|api] [--dimension N]
-      Развернуть самодостаточную папку памяти: копию бинарника, notes/, imports/,
-      пустую store.db, config.json с дефолтами, models/. Печатает путь и указатель.
-      Если папка уже существует — НЕ трогает её, печатает {"status":"already_exists"}.
+  THE STORE LOCATION. Every command needs to know which memory folder to use.
+  It is chosen in this order:
+    1. --dir <path>      flag on the command line (highest priority)
+    2. MEMORY_DIR        environment variable
+    3. otherwise, the folder where the cm binary itself sits.
+  Example: cm recall "auth" --dir ./project-memory
 
-  echo "<текст>" | cm remember [--tags a,b,c] [--source S] [--slug S]
-                                    [--relations "предикат:цель, предикат:цель"]
-      Записать заметку: пишет notes/<id>.md (точка коммита), затем индексирует.
-      В теле можно ставить [[вики-ссылки]] на другие заметки. --slug задаёт
-      человеко-имя, по которому на эту заметку ссылаются; --relations — рёбра графа
-      (цель — slug или id:<hex>). Вывод: {"id":"<hex>"}.
+================================================================================
+COMMANDS (full reference)
+================================================================================
 
-  cm recall "<запрос>" [--limit N] [--explain] [--fields a,b,c]
-                           [--tag T] [--origin-prefix F] [--min-score X] [--related <id>]
-      Гибридный поиск (ключевые слова FTS5 + семантика-вектор, слиты через RRF).
-      JSONL отсортирован по релевантности. По умолчанию N=5 и строка «худая»:
-      id, kind, body + (если заданы) tags/origin/source — пустые/null опускаются.
-      --explain      добавить отладочные числа score/fts/vector/graph (вклад каналов RRF).
-      --fields a,b,c вернуть ровно эти поля (id,kind,body,tags,origin,source,
-                     score,fts,vector,graph,created_at,preview).
-      --tag T        только заметки с тегом T; --origin-prefix F — только из файла F.
-      --min-score X  отбросить кандидатов со слитым score < X (RRF-числа мелкие).
-      --related <id> подмешать третий канал «близость по графу» к <id> (BFS по рёбрам).
-                     Включается весом search.hybrid_weights.graph (по умолчанию 0 = выкл).
+  init  — create a new memory folder. Run this once before anything else.
+  ----
+    cm init <path> [--name <name>] [--provider local|api] [--model <m>]
+                   [--dimension <n>] [--endpoint <url>]
+    Creates <path>/ with: a copy of the cm binary, an empty notes/ folder, an
+    empty imports/ folder, an empty store.db index, and a config.json.
+    If the folder already exists it is LEFT ALONE and you get
+      {"status":"already_exists"}.
+    If <path> (or any subfolder) already holds .md files, init offers (y/N) to
+    import the whole tree at once, then to delete the originals.
+    Example:  cm init ./project-memory --name project-memory
 
-  cm get <id>
-      Вернуть запись целиком (JSON).
+  remember  — save one note. THE TEXT COMES FROM STDIN.
+  --------
+    echo "<your text>" | cm remember [--tags a,b,c] [--source <s>]
+                                     [--slug <name>] [--relations "p:t, p:t"]
+    Writes the note to notes/<id>.md, then indexes it for search.
+    --tags a,b,c   comma-separated labels you can later filter on.
+    --source <s>   where the fact came from (free text), kept with the note.
+    --slug <name>  a human name OTHER notes can link to instead of the hex id.
+    --relations    graph links, as "predicate:target, predicate:target".
+                   The target is a slug, or id:<hex> to point at an exact id.
+    Inside the text you may write [[name]] to link to another note (name is its
+    slug, or id:<hex>).
+    PRINTS:  {"id":"<hex>"}   <- save this id; it names the note's file.
+    Example:
+      echo "Decided: auth uses JWT, refresh token lasts 30 days." \
+        | cm remember --tags auth,decision --slug jwt-auth
 
-  cm list [--recent N]
-      Перечислить последние записи (JSONL, body показан превью). По умолчанию 20.
+  recall  — search notes by topic. THIS IS THE MAIN READ COMMAND.
+  ------
+    cm recall "<query>" [--limit N] [--explain] [--fields a,b,c]
+                        [--tag T] [--origin-prefix F] [--min-score X]
+                        [--related <id>]
+    Searches by keywords AND by meaning at once, blends the two, and prints the
+    best matches as JSONL, best first. You do NOT need to understand the
+    blending; just read the printed lines.
+    --limit N        how many results (default 5).
+    --fields a,b,c   print ONLY these fields. Valid names:
+                       id, kind, body, tags, origin, source,
+                       score, fts, vector, graph, created_at, preview
+    --explain        also print the relevance numbers (score/fts/vector/graph).
+    --tag T          only notes carrying tag T.
+    --origin-prefix F  only chunks whose source file path starts with F.
+    --min-score X    drop matches weaker than X (the scores are small numbers).
+    --related <id>   also favor notes near <id> in the graph (off by default).
+    DEFAULT OUTPUT per line: {"id","kind","body"} plus tags/origin/source when
+    the note has them. Empty fields are omitted to save space.
+    Example:  cm recall "how does authentication work" --limit 5
 
-  cm related <id> [--depth D] [--predicate P] [--limit N] [--fields a,b,c]
-      Соседи заметки по графу (relations во frontmatter + [[вики-ссылки]] в теле).
-      Обход в ширину; по умолчанию D=1, N=5. Несуществующая цель отдаётся как
-      «висячая»: {"dangling":true,"name":"<цель>","predicate":...} без id.
-      --predicate P  только рёбра с этим предикатом (на каждом шаге).
+  get  — fetch ONE note in full, by id.
+  ---
+    cm get <id>
+    PRINTS the whole record: {"id","kind","body","tags","source","origin",
+    "created_at"}. If the id does not exist: {"found":false,"id":"<id>"}.
+    Example:  cm get 0a1b2c3d
 
-  cm forget <id>
-      Удалить заметку: удаляет notes/<id>.md и строку индекса. Чанки импорта
-      (kind=chunk) так удалить нельзя — правь imports/ и зови reindex.
-      Вывод: {"deleted": true|false, "id":"<hex>"}.
+  list  — show the most recent notes (bodies shown as short previews).
+  ----
+    cm list [--recent N]          (default N = 20)
+    Example:  cm list --recent 10
 
-  cm import <файл> [--tags a,b]
-      Импорт документа: КОПИРУЕТ оригинал в imports/ (правда) + .meta.json с тегами,
-      режет на чанки по структуре, индексирует. Чанки — производные, пересобираются.
-      Форматы: .md (по заголовкам), .txt/.html (по абзацам + overlap), .pdf (фича pdf).
-      Вывод: {"imported": "путь", "chunks": N}.
+  related  — walk the graph: which notes link to/from this one.
+  -------
+    cm related <id> [--depth D] [--predicate P] [--limit N] [--fields a,b,c]
+    Follows the note's relations and [[links]] outward.
+    --depth D      how many hops to follow (default 1).
+    --predicate P  only follow links whose predicate is P.
+    --limit N      max neighbors to return (default 5).
+    A link to a note that does not exist yet comes back as a "dangling" target:
+      {"dangling":true,"name":"<target>","predicate":"...","distance":N}
+    It has no id. It will resolve on its own once that note gets written and you
+    run `reindex`.
+    Example:  cm related 0a1b2c3d --depth 2
 
-  cm reindex [--all]
-      Пересобрать store.db из notes/ + imports/ (по хэшу содержимого, инкрементально).
-      --all — полная пересборка: стирает производное и переэмбеддит всё.
-      Вывод: {"indexed": N, "changed": M}. Чини им индекс после правок md или потери БД.
+  forget  — delete one note (the file and its search entry).
+  ------
+    cm forget <id>
+    Deletes notes/<id>.md and removes it from search.
+    PRINTS: {"deleted":true|false,"id":"<id>"}.
+    NOTE: you cannot forget a piece of an imported document (kind="chunk").
+    To remove those, edit/delete the file under imports/, then run `reindex`.
+    Example:  cm forget 0a1b2c3d
 
-  cm export <md|json|jsonl> [--out файл] [--query "тема"]
-      Выгрузить память (всю или по фильтру --query) для бэкапа/ревью/шаринга.
-      Без --out печатает в stdout.
+  import  — load a whole document into memory, split into searchable pieces.
+  ------
+    cm import <file> [--tags a,b]
+    Copies the original file into imports/ (kept as the source of truth), then
+    splits it into chunks and indexes each chunk.
+    Supported: .md (split by heading), .txt and .html (split by paragraph),
+    .pdf (only if cm was built with the pdf feature).
+    PRINTS: {"imported":"<file>","chunks":N}.
+    Example:  cm import ./docs/architecture.md --tags spec,architecture
 
-  cm log [--imports] [--recent N]
-      История операций (remember/recall/import/reindex/...). С --imports — список
-      импортов (источник imports/<файл>, оригинал, теги, число чанков, время).
+  reindex  — rebuild the search index from the files on disk.
+  -------
+    cm reindex [--all]
+    Use this after you EDIT notes/*.md or imports/* by hand, or if store.db was
+    deleted or corrupted. Normally it only re-processes changed files.
+    --all   throw the whole index away and rebuild everything from scratch.
+    PRINTS: {"indexed":N,"changed":M}.
+    The files in notes/ and imports/ are the real memory; store.db is just a
+    rebuildable index, so this command can always restore search from the files.
+    Example:  cm reindex
 
-  cm config [get <ключ> | set <ключ> <значение>]
-      Без аргументов — показать config.json (секреты замаскированы).
-      Ключи через точку: embedding.model, embedding.provider, search.hybrid_weights.fts ...
+  export  — write out a copy of the memory (for backup or sharing).
+  ------
+    cm export <md|json|jsonl> [--out <file>] [--query "<topic>"]
+    Pick a format. With --out it writes a file; without --out it prints to the
+    screen. With --query it exports only notes matching that topic.
+    Example:  cm export md --out memory-dump.md
 
-  cm help
-      Этот текст.
+  log  — show recent activity, or the list of imported documents.
+  ---
+    cm log [--recent N]      recent operations (remember/recall/import/...).
+    cm log --imports         the documents you imported (source, tags, chunks).
+    Example:  cm log --recent 20
 
-ГРАФ ЗНАНИЙ (выводится из md, пересобирается в reindex)
-  Во frontmatter заметки — необязательные slug (человеко-имя, по которому на неё
-  ссылаются) и relations (список `предикат: цель`). В теле — [[вики-ссылки]].
-  Цель ссылки разрешается по slug; префикс id: форсирует адресацию по id (id:0a1b2c3d).
-  Неразрешённая цель остаётся «висячей» и оживает, когда цель появится (на reindex).
+  config  — read or change settings in config.json.
+  ------
+    cm config                          show the whole config (secrets hidden).
+    cm config get <key>                show one value.
+    cm config set <key> <value>        change one value.
+    Keys use dots, e.g.:  embedding.provider , embedding.model ,
+    embedding.endpoint , search.hybrid_weights.fts
+    Example:  cm config set embedding.provider api
 
-ПРИМЕРЫ
-  cm init ./ --name project-memory
-  echo "Решили: авторизация на JWT, refresh — 30 дней" | cm remember --tags auth,decision
-  cm recall "как устроена авторизация" --limit 5
+  help  — print this text.
+  ----
+    cm help
+
+================================================================================
+THE KNOWLEDGE GRAPH (how notes link together)
+================================================================================
+  A note can point at other notes. There are two ways to make a link:
+    * In the body text:           write [[name]]   (name = a slug, or id:<hex>)
+    * In the note's settings:      a slug (its own name) and relations
+                                   (a list of "predicate: target").
+  A target written as plain text is matched against note slugs. Prefix it with
+  id: to point at an exact id, e.g. id:0a1b2c3d.
+  If the target does not exist yet, the link is kept as "dangling" and starts
+  working automatically once that note is written and you run `reindex`.
+  Walk these links with `cm related <id>`.
+
+================================================================================
+EMBEDDINGS (how meaning-based search is computed; in config.json)
+================================================================================
+  config key embedding.provider chooses the engine:
+    "local"  (default) — works offline, no downloads, no network. Good enough
+                         for keyword-and-shape matching.
+    "api"    — calls a neural model over HTTP (OpenAI-compatible, or Ollama).
+               The API key is read from an ENVIRONMENT VARIABLE; only the NAME
+               of that variable is stored in config (key embedding.api_key_env).
+               The key itself is never written to disk.
+  If you switch provider or model on a store that already has notes, run
+  `cm reindex --all` so all notes are re-embedded the same way.
+
+================================================================================
+WHERE FILES LIVE
+================================================================================
+  A memory folder contains:
+    cm(.exe)      a copy of this binary (so the folder is self-contained)
+    notes/        one <id>.md file per note   <- REAL MEMORY, keep it
+    imports/      copies of imported documents <- REAL MEMORY, keep it
+    store.db      the search index             <- rebuildable, can be deleted
+    config.json   settings
+  Commit notes/ and imports/ to git. store.db can be ignored and rebuilt with
+  `cm reindex`. Point cm at a folder with --dir <path> or the MEMORY_DIR env var.
+
+================================================================================
+A TYPICAL SESSION, START TO FINISH
+================================================================================
+  cm init ./project-memory --name project-memory
+  echo "Decided: auth uses JWT, refresh token lasts 30 days." \
+    | cm remember --tags auth,decision --slug jwt-auth
+  cm recall "how does authentication work" --limit 5
+  cm get 0a1b2c3d
   cm related 0a1b2c3d --depth 2
   cm import ./docs/architecture.md --tags spec,architecture
-  cm reindex --all
+  cm reindex
   cm export md --out memory-dump.md
-  cm config set embedding.provider api
-  cm config set embedding.endpoint http://localhost:11434/api/embeddings
-  cm config set embedding.api_format ollama
-
-ЭМБЕДДИНГИ (config.json → embedding)
-  provider "local"  — офлайн, детерминированный (по умолчанию, без скачивания).
-  provider "api"    — нейросетевой по HTTP (OpenAI-совместимый или Ollama).
-                      Ключ — в переменной окружения с именем embedding.api_key_env,
-                      сам ключ в конфиге не хранится.
 "#;
 
 /// The little pointer you paste into a system prompt or CLAUDE.md (desc.md §8).
