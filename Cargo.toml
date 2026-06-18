@@ -1,0 +1,50 @@
+[package]
+name = "climem"
+version = "0.1.0"
+edition = "2021"
+description = "Active memory tool — a short-lived CLI over a SQLite store with keyword (FTS5) + semantic (vector) search, plus document import/export."
+license = "MIT"
+
+# The contract calls the tool `cm`; the produced binary is `cm(.exe)`.
+[[bin]]
+name = "cm"
+path = "src/main.rs"
+
+[dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Optional neural embedding path (provider = "api"): HTTP to an OpenAI-/Ollama-
+# compatible embeddings endpoint. native-tls keeps Windows builds free of ring/nasm.
+ureq = { version = "2", default-features = false, features = ["native-tls", "json", "gzip"], optional = true }
+# Optional PDF import (heavier dependency tree; off by default).
+pdf-extract = { version = "0.7", optional = true }
+
+[features]
+# `api` is on by default so a standard `cargo build --release` yields a binary
+# that can switch to the neural provider at runtime (config-switchable). `pdf`
+# stays opt-in (heavier dependency tree).
+default = ["api"]
+api = ["dep:ureq"]
+pdf = ["dep:pdf-extract"]
+
+[dev-dependencies]
+# E2e of the `cm` binary as a black box (argv, stdin, JSONL, exit codes).
+tempfile = "3"      # isolated, auto-removed folders for store.db/config.json
+assert_cmd = "2"    # locate & run the binary, feed stdin, assert exit/stdout/stderr
+predicates = "3"    # readable assertions on output (contains / regex)
+# Local HTTP mock for the `api` provider. Cargo can't feature-gate a
+# dev-dependency, so it lives here unconditionally; the api_provider test target
+# is gated via `required-features = ["api"]` below so it only builds/runs with api.
+httpmock = "0.7"
+
+# The api-provider e2e only makes sense with the `api` feature compiled in.
+[[test]]
+name = "api_provider"
+required-features = ["api"]
+
+[profile.release]
+opt-level = 2
+lto = false
+codegen-units = 16
+strip = true

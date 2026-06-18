@@ -1,0 +1,1307 @@
+//! The command handlers. Each one opens whatever store/config it needs, does its
+//! single job, and prints JSONL, in keeping with the whole "short-lived process"
+//! idea.
+
+use crate::cli::Parsed;
+use crate::config::{self, Config};
+use crate::embed::{self, Embedder};
+use crate::export;
+use crate::graph;
+use crate::import;
+use crate::note;
+use crate::output::{self, note_preview_value, note_value, print_line, split_tags};
+use crate::search::{self, RecallOpts};
+use crate::store::Store;
+use crate::util::{content_hash_hex, mtime_secs, now, preview, AppError, Result};
+use serde_json::json;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+/// Where everything lives inside a memory folder. `notes/` and `imports/` hold
+/// the source of truth (the md files and the import originals); `store.db` is the
+/// derived index.
+pub struct Ctx {
+    pub store_path: PathBuf,
+    pub config_path: PathBuf,
+    pub notes_dir: PathBuf,
+    pub imports_dir: PathBuf,
+}
+
+impl Ctx {
+    pub fn new(dir: &Path) -> Ctx {
+        Ctx {
+            store_path: dir.join("store.db"),
+            config_path: dir.join("config.json"),
+            notes_dir: dir.join("notes"),
+            imports_dir: dir.join("imports"),
+        }
+    }
+
+    /// Path to a note's md file, i.e. its source of truth at `notes/<id>.md`.
+    pub fn note_path(&self, id: &str) -> PathBuf {
+        self.notes_dir.join(format!("{id}.md"))
+    }
+
+    fn require_store(&self) -> Result<()> {
+        if !self.store_path.exists() {
+            return Err(AppError::with_hint(
+                format!("no memory store at {}", self.store_path.display()),
+                "Run `cm init <path>`, or point at an existing folder with --dir / MEMORY_DIR.",
+            ));
+        }
+        Ok(())
+    }
+
+    fn open(&self) -> Result<(Store, Config)> {
+        self.require_store()?;
+        let cfg = Config::load(&self.config_path)?;
+        let store = Store::open(&self.store_path)?;
+        Ok((store, cfg))
+    }
+}
+
+fn read_stdin() -> Result<String> {
+    let mut s = String::new();
+    std::io::stdin().read_to_string(&mut s)?;
+    // Drop any UTF-8 BOMs (EF BB BF) that PowerShell 5.1 on Windows likes to add.
+    // PS 5.1 can emit two of them: one from the $OutputEncoding preamble, one per object.
+    Ok(s.trim_start_matches('\u{feff}').to_string())
+}
+
+/// Print a non-fatal warning if the embedder we're using now isn't the one the
+/// notes were indexed with, because then their vectors don't really compare.
+fn warn_on_drift(store: &Store, emb: &dyn Embedder) {
+    if let Ok(Some(sig)) = store.meta_get("embedder_signature") {
+        if sig != emb.signature() {
+            eprintln!(
+                "warning: embedder changed ('{}' -> '{}'); existing vectors may not match. \
+                 Run `cm reindex --all` to rebuild the index.",
+                sig,
+                emb.signature()
+            );
+        }
+    } else {
+        let _ = store.meta_set("embedder_signature", &emb.signature());
+    }
+}
+
+/// Index one note into the derived store, best-effort: build the embedder, embed,
+/// upsert. If any of that fails we just warn, because the md file has already been
+/// written (that's the real commit point), so the note isn't lost and `reindex`
+/// can patch up the index later. Returns whether indexing actually worked.
+#[allow(clippy::too_many_arguments)]
+fn index_note_best_effort(
+    store: &Store,
+    cfg: &Config,
+    id: &str,
+    body: &str,
+    tags: &str,
+    source: Option<&str>,
+    created_at: i64,
+    created_iso: &str,
+) -> bool {
+    let attempt = || -> Result<()> {
+        let emb = embed::build(cfg)?;
+        warn_on_drift(store, emb.as_ref());
+        let vec = emb.embed(body)?;
+        store.upsert_note(
+            id,
+            body,
+            tags,
+            source,
+            None,
+            "note",
+            created_at,
+            created_iso,
+            &vec,
+        )
+    };
+    match attempt() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!(
+                "warning: note saved to notes/{id}.md but indexing failed ({}); \
+                 run `cm reindex` to repair the search index.",
+                e.msg
+            );
+            false
+        }
+    }
+}
+
+// ---- remember ------------------------------------------------------------
+
+pub fn remember(p: &Parsed, ctx: &Ctx) -> Result<()> {
+    let (store, cfg) = ctx.open()?;
+    let body = read_stdin()?;
+    let body = body.trim_end_matches(['\n', '\r']).to_string();
+    if body.trim().is_empty() {
+        return Err(AppError::with_hint(
+            "remember reads the note body from stdin, but stdin was empty",
+            "echo \"Решили: авторизация на JWT\" | cm remember --tags auth,decision",
+        ));
+    }
+    let tags = p.value("tags").unwrap_or("");
+    let source = p.value("source");
+    let slug = p.value("slug").filter(|s| !s.is_empty());
+    let relations = parse_relations(p.value("relations").unwrap_or(""));
+
+    let id = store.fresh_id()?;
+    let (epoch, iso) = now();
+
+    // The md file is the commit point (desc.md §3), so write it FIRST, before we
+    // even build the embedder or index anything. That way a misconfigured embedder
+    // can't cost us the note.
+    let note_val = note::Note {
+        id: id.clone(),
+        created: iso.clone(),
+        tags: tags.to_string(),
+        source: source.map(|s| s.to_string()),
+        slug: slug.map(|s| s.to_string()),
+        relations,
+        body: body.clone(),
+    };
+    let md = note::render(&note_val);
+    std::fs::create_dir_all(&ctx.notes_dir)?;
+    std::fs::write(ctx.note_path(&id), &md)?;
+
+    // Indexing is derived and best-effort, and failing it doesn't lose the note.
+    // On success we record the sync state so the next `reindex` can skip this
+    // unchanged note.
+    if index_note_best_effort(&store, &cfg, &id, &body, tags, source, epoch, &iso) {
+        let rel = format!("notes/{id}.md");
+        let _ = store.file_state_set(
+            &rel,
+            "note",
+            &id,
+            &content_hash_hex(md.as_bytes()),
+            mtime_secs(&ctx.note_path(&id)),
+        );
+        let _ = store.set_note_slug(&id, slug); // make this note linkable by slug right away
+
+        // Derive the outgoing edges from --relations and the body's [[wiki-links]].
+        // Best-effort: targets resolve against the notes we know about right now and
+        // dangle otherwise. reindex has the final word — a target added just now
+        // resolves on the next run.
+        let ids = store.note_ids().unwrap_or_default();
+        let slug_map = graph::build_slug_map(&store.note_slugs().unwrap_or_default());
+        let _ = index_note_edges(&store, &id, &note_val, &ids, &slug_map);
+    }
+    store.log_op("remember", Some(&preview(&body, 80)))?;
+    print_line(&json!({ "id": id }));
+    Ok(())
+}
+
+// ---- recall --------------------------------------------------------------
+
+pub fn recall(p: &Parsed, ctx: &Ctx) -> Result<()> {
+    let (store, cfg) = ctx.open()?;
+    let query = p.arg(0).or_else(|| p.value("query")).ok_or_else(|| {
+        AppError::with_hint(
+            "recall needs a query",
+            "cm recall \"как устроена авторизация\" --limit 5",
+        )
+    })?;
+    let limit = parse_limit(p.value("limit"), 5)?;
+    let explain = p.has("explain");
+    let fields = match p.value("fields") {
+        Some(s) if !s.is_empty() => Some(parse_fields(s, output::RECALL_FIELDS)?),
+        _ => None,
+    };
+    let opts = RecallOpts {
+        limit,
+        tag: p.value("tag").filter(|s| !s.is_empty()),
+        origin_prefix: p.value("origin-prefix").filter(|s| !s.is_empty()),
+        min_score: parse_score(p.value("min-score"))?,
+        related: p.value("related").filter(|s| !s.is_empty()),
+    };
+
+    let emb = embed::build(&cfg)?;
+    let hits = search::recall_with(&store, emb.as_ref(), &cfg, query, &opts)?;
+    store.log_op("recall", Some(query))?;
+
+    for h in &hits {
+        print_line(&output::recall_value(
+            &h.row,
+            h.score,
+            h.fts,
+            h.vector,
+            h.graph,
+            fields.as_deref(),
+            explain,
+        ));
+    }
+    Ok(())
+}
+
+// ---- get -----------------------------------------------------------------
+
+pub fn get(p: &Parsed, ctx: &Ctx) -> Result<()> {
+    let (store, _cfg) = ctx.open()?;
+    let id = parse_id(p.arg(0))?;
+    match store.get(&id)? {
+        Some(row) => print_line(&note_value(&row)),
+        None => print_line(&json!({ "found": false, "id": id })),
+    }
+    Ok(())
+}
+
+// ---- list ----------------------------------------------------------------
+
+pub fn list(p: &Parsed, ctx: &Ctx) -> Result<()> {
+    let (store, _cfg) = ctx.open()?;
+    let recent = parse_limit(p.value("recent"), 20)?;
+    for row in store.list(recent)? {
+        print_line(&note_preview_value(&row));
+    }
+    Ok(())
+}
+
+// ---- related (graph traversal) -------------------------------------------
+
+/// `related <id>`: walk the graph outward from a note along its relations and
+/// `[[wiki-link]]` edges, and return the neighbors as lean JSONL. Dangling targets
+/// (ones nobody's written yet) come back too, marked `dangling: true` with no
+/// `id`. It's deterministic: a BTreeSet frontier plus a total order on (distance,
+/// predicate, resolved-before-dangling, key), with `--limit` applied last so the
+/// nearest neighbors win.
+pub fn related(p: &Parsed, ctx: &Ctx) -> Result<()> {
+    let (store, _cfg) = ctx.open()?;
+    let id = parse_id(p.arg(0)).map_err(|_| {
+        AppError::with_hint(
+            "related needs a note id",
+            "cm related 0a1b2c3d --depth 2",
+        )
+    })?;
+    let limit = parse_limit(p.value("limit"), 5)?;
+    let depth = parse_limit(p.value("depth"), 1)?;
+    let predicate = p.value("predicate").filter(|s| !s.is_empty());
+    let fields = match p.value("fields") {
+        Some(s) if !s.is_empty() => Some(parse_fields(s, output::RELATED_FIELDS)?),
+        _ => None,
+    };
+
+    // BFS. `visited` is the set of resolved note ids we've already emitted (seeded
+    // with the start node, so a cycle or self-loop never re-emits it), and
+    // `seen_dangling` dedups the dangling targets. Each neighbor is a tuple
+    // (distance, predicate, flag, key, row, name) where flag 0 = resolved
+    // (key = id) sorts ahead of flag 1 = dangling (key = raw text).
+    let mut visited: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    visited.insert(id.clone());
+    let mut seen_dangling: std::collections::BTreeSet<(String, String)> =
+        std::collections::BTreeSet::new();
+    let mut results: Vec<(
+        usize,
+        String,
+        u8,
+        String,
+        Option<crate::store::NoteRow>,
+        String,
+    )> = Vec::new();
+    let mut frontier: Vec<String> = vec![id.clone()];
+
+    let mut dist = 1;
+    while dist <= depth && !frontier.is_empty() {
+        frontier.sort();
+        let mut next: Vec<String> = Vec::new();
+        for src in &frontier {
+            for e in store.edges_from(src)? {
+                if let Some(pred) = predicate {
+                    if e.predicate != pred {
+                        continue; // --predicate constrains every hop
+                    }
+                }
+                match e.dst_id {
+                    Some(did) => {
+                        if visited.contains(&did) {
+                            continue;
+                        }
+                        // Resolve to the live note; a stale edge (note gone) is skipped.
+                        if let Some(row) = store.get(&did)? {
+                            visited.insert(did.clone());
+                            next.push(did.clone());
+                            results.push((dist, e.predicate, 0, did, Some(row), String::new()));
+                        }
+                    }
+                    None => {
+                        let key = (e.predicate.clone(), e.dst_raw.clone());
+                        if seen_dangling.insert(key) {
+                            results.push((
+                                dist,
+                                e.predicate,
+                                1,
+                                e.dst_raw.clone(),
+                                None,
+                                e.dst_raw,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        frontier = next;
+        dist += 1;
+    }
+
+    results.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then(a.1.cmp(&b.1))
+            .then(a.2.cmp(&b.2))
+            .then(a.3.cmp(&b.3))
+    });
+    results.truncate(limit);
+
+    for (distance, pred, _flag, _key, row, name) in &results {
+        print_line(&output::related_value(
+            row.as_ref(),
+            name,
+            pred,
+            *distance,
+            fields.as_deref(),
+        ));
+    }
+    Ok(())
+}
+
+// ---- forget --------------------------------------------------------------
+
+pub fn forget(p: &Parsed, ctx: &Ctx) -> Result<()> {
+    let (store, _cfg) = ctx.open()?;
+    let id = parse_id(p.arg(0))?;
+
+    // Imported chunks are derived from the imports/ originals, so you can't forget
+    // one directly: poking the index here would just get undone on the next reindex.
+    if let Some(row) = store.get(&id)? {
+        if row.kind == "chunk" {
+            return Err(AppError::with_hint(
+                format!("'{id}' is an imported chunk (derived from imports/) — chunks can't be forgotten directly"),
+                "Remove or edit the original under imports/, then run `cm reindex`.",
+            ));
+        }
+    }
+
+    // The md file is the source of truth: delete it first, then the index row.
+    let md = ctx.note_path(&id);
+    let had_file = md.exists();
+    if had_file {
+        std::fs::remove_file(&md)?;
+    }
+    let had_row = store.forget(&id)?;
+    store.delete_edges_from(&id)?; // drop the note's outgoing graph edges
+    store.file_state_delete(&format!("notes/{id}.md"))?;
+    store.log_op("forget", Some(&id))?;
+    print_line(&json!({ "deleted": had_file || had_row, "id": id }));
+    Ok(())
+}
+
+// ---- import --------------------------------------------------------------
+
+pub fn import(p: &Parsed, ctx: &Ctx) -> Result<()> {
+    let (store, cfg) = ctx.open()?;
+    let file = p.arg(0).ok_or_else(|| {
+        AppError::with_hint(
+            "import needs a file path",
+            "cm import ./docs/architecture.md --tags spec,architecture",
+        )
+    })?;
+    let tags = p.value("tags").unwrap_or("");
+
+    let emb = embed::build(&cfg)?;
+    warn_on_drift(&store, emb.as_ref());
+
+    let path = Path::new(file);
+    let res = import::import_file(&store, emb.as_ref(), &cfg, path, tags, &ctx.imports_dir)?;
+    store.log_op("import", Some(file))?;
+    print_line(&json!({ "imported": file, "chunks": res.chunks }));
+    Ok(())
+}
+
+// ---- reindex -------------------------------------------------------------
+
+/// Rebuild the derived index (store.db) from the source of truth: notes/*.md and
+/// the imports/ originals. By default it's incremental, using the content hash in
+/// the sync table to skip unchanged files; `--all` throws the derived tables away
+/// and rebuilds everything from scratch, re-embedding as it goes. store.db is
+/// disposable: delete it, run `reindex`, and your memory comes back (desc.md §10).
+pub fn reindex(p: &Parsed, ctx: &Ctx) -> Result<()> {
+    let cfg = Config::load(&ctx.config_path)?;
+    // store.db might be gone; Store::open just recreates it — that's the whole point.
+    let store = Store::open(&ctx.store_path)?;
+    let all = p.has("all");
+
+    if all {
+        // Don't let a full wipe destroy the only copy of legacy data: old
+        // db-as-truth notes that have no notes/*.md to rebuild from.
+        if store.count_notes_kind("note")? > 0 && count_md_files(&ctx.notes_dir) == 0 {
+            return Err(AppError::with_hint(
+                "refusing `reindex --all`: the store has notes but notes/ is empty (legacy data would be lost)",
+                "Back up first: `cm export jsonl --out backup.jsonl`, then reindex.",
+            ));
+        }
+        store.wipe_derived()?;
+    }
+
+    // Build the embedder, but fall back to keyword-only if we can't. That keeps
+    // the index rebuildable after a wipe even when the provider is misconfigured.
+    let emb = match embed::build(&cfg) {
+        Ok(e) => {
+            let _ = store.meta_set("embedder_signature", &e.signature());
+            Some(e)
+        }
+        Err(e) => {
+            eprintln!(
+                "warning: embedder unavailable ({}); rebuilding the keyword index only, \
+                 vectors skipped. Re-run `cm reindex` once the provider is configured.",
+                e.msg
+            );
+            None
+        }
+    };
+    let emb_ref = emb.as_deref();
+
+    let (n_seen, n_changed, changed_notes) = reindex_notes(&store, emb_ref, ctx)?;
+    let (i_seen, i_changed) = reindex_imports(&store, emb_ref, &cfg, ctx)?;
+
+    // Second pass: now derive graph edges for the changed notes, this time against
+    // the FULL current note set. That way a forward reference (B links to A, both
+    // written in this same run) resolves. Anything still unresolved dangles and
+    // goes live once its target shows up on a later run.
+    let ids = store.note_ids()?;
+    let slugs = store.note_slugs()?;
+    for (slug, dupes) in graph::slug_collisions(&slugs) {
+        eprintln!(
+            "warning: slug '{slug}' is shared by notes {} — links resolve to the lowest id '{}'.",
+            dupes.join(", "),
+            dupes[0]
+        );
+    }
+    let slug_map = graph::build_slug_map(&slugs);
+    for (id, note) in &changed_notes {
+        index_note_edges(&store, id, note, &ids, &slug_map)?;
+    }
+
+    store.log_op("reindex", Some(if all { "all" } else { "incremental" }))?;
+    print_line(&json!({ "indexed": n_seen + i_seen, "changed": n_changed + i_changed }));
+    Ok(())
+}
+
+/// (Re)index `notes/*.md`. Returns (files seen, files (re)indexed or pruned, and
+/// the changed notes paired with their id, which the second edge-derivation pass
+/// needs).
+type ReindexNotes = (usize, usize, Vec<(String, note::Note)>);
+
+fn reindex_notes(store: &Store, emb: Option<&dyn Embedder>, ctx: &Ctx) -> Result<ReindexNotes> {
+    let mut seen = 0usize;
+    let mut changed = 0usize;
+    let mut changed_notes: Vec<(String, note::Note)> = Vec::new();
+
+    if ctx.notes_dir.exists() {
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(&ctx.notes_dir)?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("md"))
+            .collect();
+        paths.sort(); // deterministic processing order
+        for path in paths {
+            let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            let rel = format!("notes/{fname}");
+            let bytes = std::fs::read(&path)?;
+            let hash = content_hash_hex(&bytes);
+            seen += 1;
+            if let Some((old, _)) = store.file_state_get(&rel)? {
+                if old == hash {
+                    continue; // unchanged since last index
+                }
+            }
+            let text = String::from_utf8_lossy(&bytes);
+            let parsed = match note::parse(&text) {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("warning: skipping {rel}: {}", e.msg);
+                    continue;
+                }
+            };
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            let id = if parsed.id.is_empty() {
+                stem.to_string()
+            } else {
+                parsed.id.clone()
+            };
+            if id != stem {
+                eprintln!(
+                    "warning: {rel}: frontmatter id '{id}' != filename stem '{stem}' (using frontmatter id)"
+                );
+            }
+            let created = if parsed.created.is_empty() {
+                now().1
+            } else {
+                parsed.created.clone()
+            };
+            let vec = embed_or_empty(emb, &parsed.body)?;
+            store.upsert_note(
+                &id,
+                &parsed.body,
+                &parsed.tags,
+                parsed.source.as_deref(),
+                None,
+                "note",
+                0,
+                &created,
+                &vec,
+            )?;
+            store.set_note_slug(&id, parsed.slug.as_deref())?;
+            store.file_state_set(&rel, "note", &id, &hash, mtime_secs(&path))?;
+            changed += 1;
+            changed_notes.push((id, parsed));
+        }
+    }
+
+    // Prune notes whose md file vanished (deleted out-of-band).
+    for row in store.all()? {
+        if row.kind == "note" && !ctx.note_path(&row.id).exists() {
+            store.forget(&row.id)?;
+            store.delete_edges_from(&row.id)?;
+            store.file_state_delete(&format!("notes/{}.md", row.id))?;
+            changed += 1;
+        }
+    }
+    Ok((seen, changed, changed_notes))
+}
+
+/// (Re)derive chunks from the `imports/` originals. Returns (files seen, changed).
+fn reindex_imports(
+    store: &Store,
+    emb: Option<&dyn Embedder>,
+    cfg: &Config,
+    ctx: &Ctx,
+) -> Result<(usize, usize)> {
+    let mut seen = 0usize;
+    let mut changed = 0usize;
+
+    if ctx.imports_dir.exists() {
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(&ctx.imports_dir)?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.is_file())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|n| !import::is_sidecar(n))
+                    .unwrap_or(false)
+            })
+            .collect();
+        paths.sort();
+        for path in paths {
+            let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            let rel = format!("imports/{fname}");
+            let bytes = std::fs::read(&path)?;
+            let hash = content_hash_hex(&bytes);
+            seen += 1;
+            if let Some(r) = store.import_record(&rel)? {
+                if r.content_hash == hash {
+                    continue; // unchanged original
+                }
+            }
+            // The original name and tags come from the sidecar (which is truth), so
+            // they survive even a full store.db loss. A hand-added original with no
+            // sidecar just falls back to its filename.
+            let (orig_name, tags) = import::read_sidecar(&ctx.imports_dir, fname);
+            match import::index_import(store, emb, cfg, &rel, &orig_name, &path, &tags, &hash) {
+                Ok(n) => {
+                    store.record_import(&rel, &orig_name, &tags, n as i64, &hash)?;
+                    store.file_state_set(&rel, "import", &rel, &hash, mtime_secs(&path))?;
+                    changed += 1;
+                }
+                Err(e) => eprintln!("warning: skipping import {rel}: {}", e.msg),
+            }
+        }
+    }
+
+    // Prune import records whose imports/ original vanished.
+    for imp in store.list_imports()? {
+        let name = imp.source.strip_prefix("imports/").unwrap_or(&imp.source);
+        if !ctx.imports_dir.join(name).exists() {
+            store.delete_import(&imp.source)?;
+            store.file_state_delete(&imp.source)?;
+            changed += 1;
+        }
+    }
+    Ok((seen, changed))
+}
+
+fn embed_or_empty(emb: Option<&dyn Embedder>, text: &str) -> Result<Vec<f32>> {
+    match emb {
+        Some(e) => e.embed(text),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// (Re)derive a note's outgoing edges: drop the old ones, then resolve each
+/// authored relation and body `[[wiki-link]]` target against the current note set
+/// (by slug by default, or by id when the target has an `id:` prefix). Anything
+/// that doesn't resolve is kept as a dangling edge.
+fn index_note_edges(
+    store: &Store,
+    src_id: &str,
+    note: &note::Note,
+    ids: &std::collections::HashSet<String>,
+    slug_map: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    store.delete_edges_from(src_id)?;
+    for (predicate, target, source) in graph::note_edges(note) {
+        let dst_id = graph::resolve_target(&target, ids, slug_map);
+        store.insert_edge(src_id, &predicate, dst_id.as_deref(), &target, source)?;
+    }
+    Ok(())
+}
+
+/// How many `*.md` files sit directly under `dir` (used by the reindex legacy guard).
+fn count_md_files(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("md"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+// ---- export --------------------------------------------------------------
+
+pub fn export(p: &Parsed, ctx: &Ctx) -> Result<()> {
+    let (store, cfg) = ctx.open()?;
+    let format = p.arg(0).ok_or_else(|| {
+        AppError::with_hint("export needs a format", "cm export md --out dump.md")
+    })?;
+
+    let rows = if let Some(query) = p.value("query") {
+        let emb = embed::build(&cfg)?;
+        let limit = parse_limit(p.value("limit"), 50)?;
+        search::recall(&store, emb.as_ref(), &cfg, query, limit)?
+            .into_iter()
+            .map(|h| h.row)
+            .collect()
+    } else {
+        store.all()?
+    };
+
+    let content = export::render(format, &rows)?;
+    store.log_op("export", Some(format))?;
+
+    if let Some(out) = p.value("out") {
+        std::fs::write(out, &content)?;
+        print_line(&json!({ "exported": out, "format": format, "count": rows.len() }));
+    } else {
+        print!("{content}");
+    }
+    Ok(())
+}
+
+// ---- log -----------------------------------------------------------------
+
+pub fn log(p: &Parsed, ctx: &Ctx) -> Result<()> {
+    let (store, _cfg) = ctx.open()?;
+    if p.has("imports") {
+        for imp in store.list_imports()? {
+            print_line(&json!({
+                "source": imp.source,
+                "orig": imp.orig_name,
+                "tags": split_tags(&imp.tags),
+                "chunks": imp.chunks,
+                "at": imp.created_iso,
+            }));
+        }
+    } else {
+        let recent = parse_limit(p.value("recent"), 50)?;
+        for row in store.recent_logs(recent)? {
+            print_line(&json!({ "at": row.created_iso, "op": row.op, "detail": row.detail }));
+        }
+    }
+    Ok(())
+}
+
+// ---- config --------------------------------------------------------------
+
+pub fn config(p: &Parsed, ctx: &Ctx) -> Result<()> {
+    ctx.require_store()?;
+    let path = &ctx.config_path;
+    let sub = p.arg(0);
+
+    match sub {
+        None => {
+            let raw = config::load_raw(path)?;
+            let masked = config::mask_secrets(&raw);
+            println!("{}", serde_json::to_string_pretty(&masked)?);
+        }
+        Some("get") => {
+            let key = p.arg(1).ok_or_else(|| {
+                AppError::with_hint(
+                    "config get needs a key",
+                    "cm config get embedding.model",
+                )
+            })?;
+            let raw = config::load_raw(path)?;
+            match config::get_path(&raw, key) {
+                Some(v) => println!("{}", config::mask_secrets(v)),
+                None => return Err(AppError::new(format!("no such config key: {key}"))),
+            }
+        }
+        Some("set") => {
+            let key = p.arg(1).ok_or_else(|| {
+                AppError::with_hint(
+                    "config set needs a key and a value",
+                    "cm config set embedding.provider api",
+                )
+            })?;
+            let val = p.arg(2).ok_or_else(|| {
+                AppError::with_hint(
+                    "config set needs a value",
+                    "cm config set embedding.dimension 768",
+                )
+            })?;
+            let mut raw = config::load_raw(path)?;
+            config::set_path(&mut raw, key, val)?;
+            // Validate the result still deserializes into a Config.
+            serde_json::from_value::<Config>(raw.clone())
+                .map_err(|e| AppError::new(format!("resulting config is invalid: {e}")))?;
+            config::save_raw(path, &raw)?;
+            let stored = config::get_path(&raw, key)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            print_line(&json!({ "set": key, "value": config::mask_secrets(&stored) }));
+        }
+        Some(other) => {
+            return Err(AppError::with_hint(
+                format!("unknown config subcommand '{other}'"),
+                "Use: cm config | cm config get <key> | cm config set <key> <value>",
+            ))
+        }
+    }
+    Ok(())
+}
+
+// ---- helpers -------------------------------------------------------------
+
+/// Validate a note id: non-empty lowercase hex (`0-9a-f`). Note ids are short
+/// random hex written in the md frontmatter (and equal to the filename stem),
+/// not integers.
+fn parse_id(arg: Option<&str>) -> Result<String> {
+    let s = arg.ok_or_else(|| AppError::with_hint("expected an id", "cm get 0a1b2c3d"))?;
+    let is_hex = |c: char| c.is_ascii_digit() || ('a'..='f').contains(&c);
+    if s.is_empty() || !s.chars().all(is_hex) {
+        return Err(AppError::with_hint(
+            format!("id must be lowercase hex, got '{s}'"),
+            "cm get 0a1b2c3d",
+        ));
+    }
+    Ok(s.to_string())
+}
+
+fn parse_limit(arg: Option<&str>, default: usize) -> Result<usize> {
+    match arg {
+        None | Some("") => Ok(default),
+        Some(s) => s
+            .parse::<usize>()
+            .map_err(|_| AppError::new(format!("limit must be a number, got '{s}'"))),
+    }
+}
+
+/// Parse a `--relations "pred:target, pred:target"` string into edge pairs. We
+/// split items on commas, and each item on its FIRST colon, so an `id:<hex>`
+/// target keeps its prefix. Anything malformed (no colon, or a blank side) is
+/// just dropped.
+fn parse_relations(arg: &str) -> Vec<(String, String)> {
+    arg.split(',')
+        .filter_map(|item| {
+            let (pred, target) = item.split_once(':')?;
+            let (pred, target) = (pred.trim(), target.trim());
+            (!pred.is_empty() && !target.is_empty()).then(|| (pred.to_string(), target.to_string()))
+        })
+        .collect()
+}
+
+/// Parse a `--fields a,b,c` list and check every name against `allowed` (the
+/// command's own field set: `RECALL_FIELDS` for recall, `RELATED_FIELDS` for related).
+fn parse_fields(arg: &str, allowed: &[&str]) -> Result<Vec<String>> {
+    let fields: Vec<String> = arg
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if fields.is_empty() {
+        return Err(AppError::with_hint(
+            "--fields needs at least one field name",
+            "cm recall \"тема\" --fields id,body",
+        ));
+    }
+    for f in &fields {
+        if !allowed.contains(&f.as_str()) {
+            return Err(AppError::with_hint(
+                format!("unknown --fields name '{f}'"),
+                format!("Valid: {}", allowed.join(",")),
+            ));
+        }
+    }
+    Ok(fields)
+}
+
+/// Parse an optional `--min-score` floor; missing or empty means 0.0, i.e. keep
+/// everything. K1.
+fn parse_score(arg: Option<&str>) -> Result<f32> {
+    match arg {
+        None | Some("") => Ok(0.0),
+        Some(s) => s.parse::<f32>().map_err(|_| {
+            AppError::with_hint(
+                format!("--min-score must be a number, got '{s}'"),
+                "cm recall \"тема\" --min-score 0.01",
+            )
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn parsed(args: &[&str]) -> Parsed {
+        Parsed::parse(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    /// A temp folder scaffolded like `init` (config.json + store.db + dirs).
+    fn setup() -> (TempDir, Ctx) {
+        let dir = TempDir::new().unwrap();
+        Config::default()
+            .save(&dir.path().join("config.json"))
+            .unwrap();
+        Store::create(&dir.path().join("store.db")).unwrap();
+        std::fs::create_dir_all(dir.path().join("notes")).unwrap();
+        std::fs::create_dir_all(dir.path().join("imports")).unwrap();
+        let ctx = Ctx::new(dir.path());
+        (dir, ctx)
+    }
+
+    fn open_store(ctx: &Ctx) -> Store {
+        Store::open(&ctx.store_path).unwrap()
+    }
+
+    // ---- pure helpers ---------------------------------------------------
+
+    #[test]
+    fn parse_relations_pairs_and_id_prefix() {
+        assert_eq!(
+            parse_relations("depends_on: db-schema, blocks: id:9f8e7d"),
+            vec![
+                ("depends_on".to_string(), "db-schema".to_string()),
+                ("blocks".to_string(), "id:9f8e7d".to_string()), // first colon only
+            ]
+        );
+        assert!(parse_relations("").is_empty());
+        assert!(parse_relations("garbage, no-colon").is_empty()); // malformed dropped
+    }
+
+    #[test]
+    fn parse_fields_valid_and_trims() {
+        assert_eq!(
+            parse_fields("id, body ,origin", output::RECALL_FIELDS).unwrap(),
+            vec!["id", "body", "origin"]
+        );
+        assert_eq!(
+            parse_fields("preview", output::RECALL_FIELDS).unwrap(),
+            vec!["preview"]
+        );
+    }
+
+    #[test]
+    fn parse_fields_empty_and_unknown_error_with_hint() {
+        let empty = parse_fields("  ,  ", output::RECALL_FIELDS).unwrap_err();
+        assert!(empty.msg.contains("at least one field"));
+        assert!(empty.hint.is_some());
+        let bad = parse_fields("id,bogus", output::RECALL_FIELDS).unwrap_err();
+        assert!(bad.msg.contains("unknown --fields name 'bogus'"));
+        assert!(bad.hint.is_some());
+        // `related`-only fields are valid for related but not for recall.
+        assert!(parse_fields("distance", output::RELATED_FIELDS).is_ok());
+        assert!(parse_fields("distance", output::RECALL_FIELDS).is_err());
+    }
+
+    #[test]
+    fn parse_score_default_and_parse_and_error() {
+        assert_eq!(parse_score(None).unwrap(), 0.0);
+        assert_eq!(parse_score(Some("")).unwrap(), 0.0);
+        assert!((parse_score(Some("0.01")).unwrap() - 0.01).abs() < 1e-9);
+        let err = parse_score(Some("x")).unwrap_err();
+        assert!(err.msg.contains("--min-score must be a number"));
+        assert!(err.hint.is_some());
+    }
+
+    #[test]
+    fn parse_id_none_returns_error_with_hint() {
+        let err = parse_id(None).unwrap_err();
+        assert!(err.msg.contains("expected an id"));
+        assert!(err.hint.is_some());
+    }
+
+    #[test]
+    fn parse_id_valid_hex() {
+        assert_eq!(parse_id(Some("0a1b2c")).unwrap(), "0a1b2c");
+        assert_eq!(parse_id(Some("42")).unwrap(), "42"); // hex-shaped digits ok
+        assert_eq!(parse_id(Some("deadbeef")).unwrap(), "deadbeef");
+    }
+
+    #[test]
+    fn parse_id_non_hex_error() {
+        // Uppercase, non-hex letters, and separators are all rejected.
+        for bad in ["XYZ", "g123", "0a1b2c-", "ab cd", "-1"] {
+            let err = parse_id(Some(bad)).unwrap_err();
+            assert!(err.msg.contains("id must be lowercase hex"), "{bad}");
+            assert!(err.hint.is_some());
+        }
+        let empty = parse_id(Some("")).unwrap_err();
+        assert!(empty.msg.contains("id must be lowercase hex"));
+    }
+
+    #[test]
+    fn parse_limit_none_and_empty_use_default() {
+        assert_eq!(parse_limit(None, 8).unwrap(), 8);
+        assert_eq!(parse_limit(Some(""), 8).unwrap(), 8);
+    }
+
+    #[test]
+    fn parse_limit_valid_and_invalid() {
+        assert_eq!(parse_limit(Some("5"), 8).unwrap(), 5);
+        let err = parse_limit(Some("x"), 8).unwrap_err();
+        assert!(err.msg.contains("limit must be a number"));
+        assert!(err.hint.is_none());
+    }
+
+    #[test]
+    fn ctx_new_builds_paths() {
+        let ctx = Ctx::new(Path::new("/tmp/mem"));
+        assert!(ctx.store_path.ends_with("store.db"));
+        assert!(ctx.config_path.ends_with("config.json"));
+    }
+
+    #[test]
+    fn require_store_missing_errors() {
+        let dir = TempDir::new().unwrap();
+        let err = Ctx::new(dir.path()).require_store().unwrap_err();
+        assert!(err.msg.contains("no memory store"));
+        assert!(err.hint.is_some());
+    }
+
+    // ---- handler integration -------------------------------------------
+
+    #[test]
+    fn get_existing_and_missing_id() {
+        let (_d, ctx) = setup();
+        let id = open_store(&ctx)
+            .insert_note("hi", "", None, None, "note", &[0.1])
+            .unwrap();
+        assert!(get(&parsed(&["get", id.as_str()]), &ctx).is_ok());
+        assert!(get(&parsed(&["get", "ffffff"]), &ctx).is_ok()); // found:false, still Ok
+    }
+
+    #[test]
+    fn forget_deletes_and_reports_false_for_missing() {
+        let (_d, ctx) = setup();
+        let id = open_store(&ctx)
+            .insert_note("hi", "", None, None, "note", &[0.1])
+            .unwrap();
+        assert!(forget(&parsed(&["forget", id.as_str()]), &ctx).is_ok());
+        assert!(open_store(&ctx).get(&id).unwrap().is_none());
+        assert!(forget(&parsed(&["forget", "ffffff"]), &ctx).is_ok());
+    }
+
+    #[test]
+    fn forget_note_removes_md_file_and_index_row() {
+        let (_d, ctx) = setup();
+        let id = "a1b2c3";
+        std::fs::write(ctx.note_path(id), "---\nid: a1b2c3\ncreated: t\n---\nbody").unwrap();
+        open_store(&ctx)
+            .upsert_note(id, "body", "", None, None, "note", 0, "t", &[0.1])
+            .unwrap();
+        assert!(ctx.note_path(id).exists());
+        forget(&parsed(&["forget", id]), &ctx).unwrap();
+        assert!(!ctx.note_path(id).exists()); // md (source of truth) removed
+        assert!(open_store(&ctx).get(id).unwrap().is_none()); // index row removed
+    }
+
+    #[test]
+    fn forget_chunk_refuses_with_hint() {
+        let (_d, ctx) = setup();
+        open_store(&ctx)
+            .upsert_note(
+                "c0ffee",
+                "chunk body",
+                "",
+                Some("doc.md"),
+                Some("doc.md › H"),
+                "chunk",
+                0,
+                "t",
+                &[0.1],
+            )
+            .unwrap();
+        let err = forget(&parsed(&["forget", "c0ffee"]), &ctx).unwrap_err();
+        assert!(err.msg.contains("imported chunk"));
+        assert!(err.hint.is_some());
+        // The chunk's index row is untouched (only reindex can remove it).
+        assert!(open_store(&ctx).get("c0ffee").unwrap().is_some());
+    }
+
+    // ---- related (graph) ------------------------------------------------
+
+    #[test]
+    fn related_traverses_depth_predicate_and_dangling() {
+        let (_d, ctx) = setup();
+        // A --depends_on--> B (slug) ; B --links_to--> C ; A --links_to--> ghost
+        std::fs::write(
+            ctx.note_path("a00001"),
+            "---\nid: a00001\ncreated: t\nrelations:\n  - depends_on: beta\n---\nsee [[ghost]]",
+        )
+        .unwrap();
+        std::fs::write(
+            ctx.note_path("b00002"),
+            "---\nid: b00002\ncreated: t\nslug: beta\n---\nlinks [[gamma]]",
+        )
+        .unwrap();
+        std::fs::write(
+            ctx.note_path("c00003"),
+            "---\nid: c00003\ncreated: t\nslug: gamma\n---\ngamma note",
+        )
+        .unwrap();
+        reindex(&parsed(&["reindex"]), &ctx).unwrap();
+
+        // depth 1 from A: neighbor B (depends_on) + dangling ghost (links_to).
+        assert!(related(&parsed(&["related", "a00001"]), &ctx).is_ok());
+
+        // Build results directly to assert structure (the handler prints to stdout).
+        let store = open_store(&ctx);
+        let d1 = store.edges_from("a00001").unwrap();
+        assert_eq!(d1.len(), 2);
+        // B resolves via slug "beta"; ghost stays dangling.
+        assert!(d1.iter().any(|e| e.dst_id.as_deref() == Some("b00002")));
+        assert!(d1
+            .iter()
+            .any(|e| e.dst_id.is_none() && e.dst_raw == "ghost"));
+        // B -> C resolves via slug "gamma" (depth 2 reachable).
+        let from_b = store.edges_from("b00002").unwrap();
+        assert!(from_b.iter().any(|e| e.dst_id.as_deref() == Some("c00003")));
+
+        // --predicate filters: depends_on only -> no links_to/ghost.
+        assert!(related(
+            &parsed(&[
+                "related",
+                "a00001",
+                "--predicate",
+                "depends_on",
+                "--depth",
+                "2"
+            ]),
+            &ctx
+        )
+        .is_ok());
+        // Missing id errors with a hint.
+        let err = related(&parsed(&["related"]), &ctx).unwrap_err();
+        assert!(err.hint.is_some());
+    }
+
+    // ---- reindex --------------------------------------------------------
+
+    #[test]
+    fn reindex_rebuilds_notes_and_recovers_after_store_deleted() {
+        let (_d, ctx) = setup();
+        std::fs::write(
+            ctx.note_path("aa11bb22"),
+            "---\nid: aa11bb22\ncreated: 2026-01-01T00:00:00Z\ntags: x\n---\nrecovered body",
+        )
+        .unwrap();
+        // Simulate losing store.db entirely; the md file is what we rebuild from.
+        std::fs::remove_file(&ctx.store_path).unwrap();
+        reindex(&parsed(&["reindex"]), &ctx).unwrap();
+        let row = open_store(&ctx).get("aa11bb22").unwrap().unwrap();
+        assert_eq!(row.body, "recovered body");
+        assert_eq!(row.tags, "x");
+        assert_eq!(row.created_iso, "2026-01-01T00:00:00Z"); // created from frontmatter, not now()
+    }
+
+    #[test]
+    fn reindex_incremental_indexes_then_prunes_deleted_md() {
+        let (_d, ctx) = setup();
+        std::fs::write(
+            ctx.note_path("aabbcc01"),
+            "---\nid: aabbcc01\ncreated: t\n---\none",
+        )
+        .unwrap();
+        std::fs::write(
+            ctx.note_path("aabbcc02"),
+            "---\nid: aabbcc02\ncreated: t\n---\ntwo",
+        )
+        .unwrap();
+        reindex(&parsed(&["reindex"]), &ctx).unwrap();
+        assert!(open_store(&ctx).get("aabbcc01").unwrap().is_some());
+        assert!(open_store(&ctx).get("aabbcc02").unwrap().is_some());
+        // Delete one md out-of-band; the next reindex prunes its derived row.
+        std::fs::remove_file(ctx.note_path("aabbcc01")).unwrap();
+        reindex(&parsed(&["reindex"]), &ctx).unwrap();
+        assert!(open_store(&ctx).get("aabbcc01").unwrap().is_none());
+        assert!(open_store(&ctx).get("aabbcc02").unwrap().is_some());
+    }
+
+    #[test]
+    fn reindex_all_rebuilds_from_md() {
+        let (_d, ctx) = setup();
+        std::fs::write(
+            ctx.note_path("ab12cd34"),
+            "---\nid: ab12cd34\ncreated: t\n---\nbody all",
+        )
+        .unwrap();
+        reindex(&parsed(&["reindex", "--all"]), &ctx).unwrap();
+        assert_eq!(
+            open_store(&ctx).get("ab12cd34").unwrap().unwrap().body,
+            "body all"
+        );
+    }
+
+    #[test]
+    fn reindex_recovers_imported_chunks_and_tags_after_store_deleted() {
+        let (dir, ctx) = setup();
+        // Import a doc: the original is copied into imports/ with a tags sidecar.
+        let src = dir.path().join("architecture.md");
+        std::fs::write(&src, "# Auth\nalpha beta gamma\n## DB\ndelta epsilon").unwrap();
+        let emb = embed::build(&Config::default()).unwrap();
+        import::import_file(
+            &open_store(&ctx),
+            emb.as_ref(),
+            &Config::default(),
+            &src,
+            "spec,arch",
+            &ctx.imports_dir,
+        )
+        .unwrap();
+        let before: Vec<_> = open_store(&ctx).all().unwrap();
+        assert!(!before.is_empty() && before.iter().all(|r| r.kind == "chunk"));
+
+        // Lose the entire store.db, then rebuild purely from imports/ + sidecar.
+        std::fs::remove_file(&ctx.store_path).unwrap();
+        reindex(&parsed(&["reindex"]), &ctx).unwrap();
+
+        let after = open_store(&ctx).all().unwrap();
+        assert_eq!(after.len(), before.len()); // chunks rebuilt deterministically
+                                               // Tags survived via the sidecar (not just store.db).
+        assert!(after.iter().all(|r| r.tags == "spec,arch"));
+        assert_eq!(
+            open_store(&ctx)
+                .import_record("imports/architecture.md")
+                .unwrap()
+                .unwrap()
+                .tags,
+            "spec,arch"
+        );
+        // Chunk ids are stable across the rebuild (content-addressed).
+        let ids_before: std::collections::BTreeSet<_> =
+            before.iter().map(|r| r.id.clone()).collect();
+        let ids_after: std::collections::BTreeSet<_> = after.iter().map(|r| r.id.clone()).collect();
+        assert_eq!(ids_before, ids_after);
+    }
+
+    #[test]
+    fn reindex_derives_graph_edges_with_slug_resolution_and_dangling() {
+        let (_d, ctx) = setup();
+        // Note A carries a slug; note B (written to sort BEFORE A) links to it by
+        // slug via a relation AND a wiki-link, plus a dangling [[ghost]].
+        std::fs::write(
+            ctx.note_path("aa00ff"),
+            "---\nid: aa00ff\ncreated: t\nrelations:\n  - depends_on: db-schema\n---\nlinks [[db-schema]] and [[ghost]]",
+        )
+        .unwrap();
+        std::fs::write(
+            ctx.note_path("zz99ee"),
+            "---\nid: zz99ee\ncreated: t\nslug: DB Schema\n---\nthe schema note",
+        )
+        .unwrap();
+        reindex(&parsed(&["reindex"]), &ctx).unwrap();
+        let edges = open_store(&ctx).edges_from("aa00ff").unwrap();
+        assert_eq!(edges.len(), 3);
+        // Forward reference + slug normalization: both the relation and the
+        // wiki-link resolve to zz99ee (slug "DB Schema" -> "db-schema").
+        let resolved = edges
+            .iter()
+            .filter(|e| e.dst_id.as_deref() == Some("zz99ee"))
+            .count();
+        assert_eq!(resolved, 2);
+        // The unknown target stays dangling (dst_id NULL), keeping its raw text.
+        let dangling: Vec<_> = edges.iter().filter(|e| e.dst_id.is_none()).collect();
+        assert_eq!(dangling.len(), 1);
+        assert_eq!(dangling[0].dst_raw, "ghost");
+        assert_eq!(dangling[0].predicate, "links_to");
+    }
+
+    #[test]
+    fn reindex_all_refuses_to_wipe_legacy_data() {
+        let (_d, ctx) = setup();
+        // A note row in the DB but no notes/*.md (the legacy db-as-truth shape).
+        open_store(&ctx)
+            .upsert_note("dead00", "legacy", "", None, None, "note", 0, "t", &[0.1])
+            .unwrap();
+        let err = reindex(&parsed(&["reindex", "--all"]), &ctx).unwrap_err();
+        assert!(err.msg.contains("refusing"));
+        assert!(err.hint.is_some());
+        assert!(open_store(&ctx).get("dead00").unwrap().is_some()); // not wiped
+    }
+
+    #[test]
+    fn list_and_log_handlers_run() {
+        let (_d, ctx) = setup();
+        open_store(&ctx)
+            .insert_note("hi", "", None, None, "note", &[0.1])
+            .unwrap();
+        assert!(list(&parsed(&["list", "--recent", "2"]), &ctx).is_ok());
+        assert!(log(&parsed(&["log"]), &ctx).is_ok());
+        assert!(log(&parsed(&["log", "--imports"]), &ctx).is_ok());
+    }
+
+    #[test]
+    fn open_missing_config_errors() {
+        let dir = TempDir::new().unwrap();
+        // store.db exists but config.json is absent.
+        Store::create(&dir.path().join("store.db")).unwrap();
+        let ctx = Ctx::new(dir.path());
+        let err = get(&parsed(&["get", "1"]), &ctx).unwrap_err();
+        assert!(err.msg.contains("config.json not found"));
+    }
+
+    #[test]
+    fn config_show_missing_config_file_errors() {
+        let dir = TempDir::new().unwrap();
+        Store::create(&dir.path().join("store.db")).unwrap();
+        let ctx = Ctx::new(dir.path());
+        // `config` (no sub) goes through load_raw, bypassing open().
+        let err = config(&parsed(&["config"]), &ctx).unwrap_err();
+        assert!(err.msg.contains("config.json not found"));
+    }
+
+    #[test]
+    fn warn_on_drift_first_run_records_signature() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let emb = embed::build(&Config::default()).unwrap();
+        assert_eq!(store.meta_get("embedder_signature").unwrap(), None);
+        warn_on_drift(&store, emb.as_ref());
+        assert_eq!(
+            store.meta_get("embedder_signature").unwrap().as_deref(),
+            Some(emb.signature().as_str()),
+        );
+    }
+
+    #[cfg(feature = "api")]
+    #[test]
+    fn api_provider_without_endpoint_errors() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = Config::default();
+        cfg.embedding.provider = "api".into(); // endpoint stays None
+        cfg.save(&dir.path().join("config.json")).unwrap();
+        Store::create(&dir.path().join("store.db")).unwrap();
+        let ctx = Ctx::new(dir.path());
+        let err = recall(&parsed(&["recall", "query"]), &ctx).unwrap_err();
+        assert!(err.msg.contains("endpoint is not set"));
+    }
+}
