@@ -37,6 +37,31 @@ pub fn normalize_slug(s: &str) -> String {
     out
 }
 
+/// Normalize an edge predicate so the same verb spelled different ways collapses
+/// to one: lowercase it and fold any run of separators (space / `-` / `_`) into a
+/// single `_`, so `depends_on`, `depends-on`, and `Depends On` are all the one
+/// predicate `depends_on`. We pick `_` (not `-`, like slugs) because that's how
+/// authored relations already read, and `--predicate` filtering keys off it.
+/// (We deliberately don't split camelCase: `dependsOn` stays as written.)
+pub fn normalize_predicate(p: &str) -> String {
+    let mut out = String::new();
+    let mut pending_sep = false;
+    for ch in p.trim().chars() {
+        if ch.is_whitespace() || ch == '-' || ch == '_' {
+            pending_sep = !out.is_empty();
+        } else {
+            if pending_sep {
+                out.push('_');
+                pending_sep = false;
+            }
+            for lc in ch.to_lowercase() {
+                out.push(lc);
+            }
+        }
+    }
+    out
+}
+
 /// Pull the `[[target]]` / `[[target|label]]` wiki-link targets out of a body, in
 /// order. It's a plain text scan, not a real markdown parse, so a `[[link]]`
 /// sitting inside a code span counts too. That's fine: edges are cheap, derived,
@@ -62,11 +87,12 @@ pub fn scan_wikilinks(body: &str) -> Vec<String> {
 }
 
 /// Every `(predicate, target, source)` edge a note contributes: its authored
-/// `relations` (predicate lower-cased) plus the body's wiki-links (`links_to`).
+/// `relations` (predicate normalized via `normalize_predicate`) plus the body's
+/// wiki-links (under the synthetic, already-normalized predicate `links_to`).
 pub fn note_edges(note: &Note) -> Vec<(String, String, &'static str)> {
     let mut edges = Vec::new();
     for (pred, target) in &note.relations {
-        let p = pred.trim().to_lowercase();
+        let p = normalize_predicate(pred);
         let t = target.trim();
         if !p.is_empty() && !t.is_empty() {
             edges.push((p, t.to_string(), "relation"));
@@ -144,6 +170,27 @@ mod tests {
         assert_eq!(normalize_slug("a  b\tc"), "a-b-c");
         assert_eq!(normalize_slug("Авторизация"), "авторизация");
         assert_eq!(normalize_slug("--leading--trailing--"), "leading-trailing");
+    }
+
+    #[test]
+    fn normalize_predicate_folds_case_and_separators() {
+        assert_eq!(normalize_predicate("depends_on"), "depends_on");
+        assert_eq!(normalize_predicate("depends-on"), "depends_on");
+        assert_eq!(normalize_predicate("Depends On"), "depends_on");
+        assert_eq!(normalize_predicate("  DEPENDS__ON  "), "depends_on");
+        // camelCase is left intact (we don't split on a case boundary).
+        assert_eq!(normalize_predicate("dependsOn"), "dependson");
+        // Cyrillic predicates fold case but keep the script.
+        assert_eq!(normalize_predicate("Зависит От"), "зависит_от");
+    }
+
+    #[test]
+    fn note_edges_normalizes_predicate_separators() {
+        let note = Note {
+            relations: vec![("Depends-On".into(), "db-schema".into())],
+            ..Default::default()
+        };
+        assert_eq!(note_edges(&note)[0].0, "depends_on");
     }
 
     #[test]

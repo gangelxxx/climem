@@ -13,6 +13,14 @@ use std::path::Path;
 pub struct Config {
     #[serde(default)]
     pub name: String,
+    /// Where the derived data lives (store.db, notes/, imports/, models/), RELATIVE
+    /// to this config.json's own folder (or an absolute path). This lets the binary
+    /// plus config.json sit at the project root while the data lives in a subfolder.
+    /// Defaults to the config's own folder (value `.`) for backward compatibility, so
+    /// a config without this key keeps the old single-folder layout (data next to
+    /// config). `cm init` writes `memory`, splitting config-at-root from data-under-memory.
+    #[serde(default = "default_data_dir")]
+    pub data_dir: String,
     #[serde(default)]
     pub embedding: Embedding,
     #[serde(default)]
@@ -60,6 +68,17 @@ pub struct Search {
     /// ranks, smaller sharpens it; 60 is the usual OpenSearch/TREC default. Plan R1.
     #[serde(default = "default_rrf_k")]
     pub rrf_k: usize,
+    /// How many graph hops the `recall --related <id>` proximity channel explores
+    /// (D8). Defaults to 2; `cm related` uses its own `--depth` (default 1). Kept
+    /// configurable so the recall channel's reach is no longer a silent hardcode.
+    #[serde(default = "default_graph_depth")]
+    pub graph_depth: usize,
+    /// Optional predicate filter for the `recall --related` graph channel (D9):
+    /// when set (and non-empty), the channel only follows edges with this
+    /// (normalized) predicate, mirroring `related --predicate`. Empty/absent =
+    /// follow every predicate.
+    #[serde(default)]
+    pub graph_predicate: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -94,6 +113,12 @@ fn default_version() -> u32 {
     // truth, and store.db is just an index `reindex` rebuilds (desc.md §3).
     2
 }
+fn default_data_dir() -> String {
+    // "." = same folder as config.json (the legacy single-folder layout). A config
+    // missing the key (older store) keeps working unchanged. New `init` overrides
+    // this to "memory".
+    ".".into()
+}
 fn default_provider() -> String {
     "local".into()
 }
@@ -123,6 +148,9 @@ fn default_candidates() -> usize {
 }
 fn default_rrf_k() -> usize {
     60
+}
+fn default_graph_depth() -> usize {
+    2
 }
 fn half() -> f32 {
     0.5
@@ -156,6 +184,8 @@ impl Default for Search {
             hybrid_weights: HybridWeights::default(),
             candidates: default_candidates(),
             rrf_k: default_rrf_k(),
+            graph_depth: default_graph_depth(),
+            graph_predicate: String::new(),
         }
     }
 }
@@ -171,6 +201,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             name: String::new(),
+            data_dir: default_data_dir(),
             embedding: Embedding::default(),
             search: Search::default(),
             chunking: Chunking::default(),
@@ -188,11 +219,17 @@ impl Config {
     }
 
     pub fn load(path: &Path) -> Result<Config> {
-        let text = std::fs::read_to_string(path).map_err(|_| {
-            AppError::with_hint(
+        let text = std::fs::read_to_string(path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => AppError::with_hint(
                 format!("config.json not found at {}", path.display()),
                 "Run `cm init <path>` first, or set MEMORY_DIR to a memory folder.",
-            )
+            ),
+            // Don't let a permission/is-a-directory/IO error masquerade as
+            // "not found" — that hint would be wrong and wouldn't self-heal.
+            _ => AppError::new(format!(
+                "could not read config.json at {}: {e}",
+                path.display()
+            )),
         })?;
         let cfg: Config = serde_json::from_str(&text)
             .map_err(|e| AppError::new(format!("config.json is invalid: {e}")))?;
@@ -208,11 +245,15 @@ impl Config {
 
 /// Load the raw JSON value (preserving unknown keys) for `get`/`set`.
 pub fn load_raw(path: &Path) -> Result<Value> {
-    let text = std::fs::read_to_string(path).map_err(|_| {
-        AppError::with_hint(
+    let text = std::fs::read_to_string(path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => AppError::with_hint(
             format!("config.json not found at {}", path.display()),
             "Run `cm init <path>` first.",
-        )
+        ),
+        _ => AppError::new(format!(
+            "could not read config.json at {}: {e}",
+            path.display()
+        )),
     })?;
     Ok(serde_json::from_str(&text)?)
 }
@@ -282,7 +323,28 @@ pub fn mask_secrets(v: &Value) -> Value {
             }
             Value::Object(out)
         }
+        // Redact credentials embedded in a URL value (e.g. an endpoint like
+        // `https://user:pass@host/...`) — the key name wouldn't flag it as secret.
+        Value::String(s) => Value::String(redact_url_userinfo(s)),
         other => other.clone(),
+    }
+}
+
+/// If `s` is a URL with a userinfo component (`scheme://user:pass@host/...`),
+/// replace the userinfo with `***` so credentials aren't printed. Non-URL or
+/// userinfo-free strings are returned unchanged.
+fn redact_url_userinfo(s: &str) -> String {
+    let Some(scheme_end) = s.find("://") else {
+        return s.to_string();
+    };
+    let after = scheme_end + 3;
+    let rest = &s[after..];
+    // userinfo ends at the first '@', but only if it comes before the path/query
+    // (an '@' after the first '/' belongs to the path, not the authority).
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    match rest[..authority_end].find('@') {
+        Some(at) => format!("{}***@{}", &s[..after], &rest[at + 1..]),
+        None => s.to_string(),
     }
 }
 
@@ -310,6 +372,8 @@ mod tests {
 
         assert_eq!(c.search.candidates, 50);
         assert_eq!(c.search.rrf_k, 60);
+        assert_eq!(c.search.graph_depth, 2); // recall --related explores 2 hops
+        assert!(c.search.graph_predicate.is_empty()); // no predicate filter by default
         assert_eq!(c.chunking.max_tokens, 200);
         assert_eq!(c.chunking.overlap, 32);
         assert_eq!(c.version, 2);
@@ -439,6 +503,21 @@ mod tests {
         assert_eq!(m["empty_secret"], json!(""));
         assert_eq!(m["Password"], json!("***"));
         assert_eq!(m["name"], json!("m"));
+    }
+
+    #[test]
+    fn mask_secrets_redacts_url_userinfo_in_endpoint() {
+        let v = json!({"endpoint": "https://user:pass@host/v1/embeddings"});
+        assert_eq!(
+            mask_secrets(&v)["endpoint"],
+            json!("https://***@host/v1/embeddings")
+        );
+        // A plain URL (no userinfo) and an '@' in the path are left untouched.
+        let plain = json!({"endpoint": "https://host/v1/path@x"});
+        assert_eq!(
+            mask_secrets(&plain)["endpoint"],
+            json!("https://host/v1/path@x")
+        );
     }
 
     #[test]

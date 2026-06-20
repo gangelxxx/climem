@@ -33,6 +33,19 @@ const VALUE_FLAGS: &[&str] = &[
     "relations",
     // graph re-rank channel for `recall`: --related <id>
     "related",
+    // code graph (`map`): index with --lang/--exclude; query with
+    // --query <name> | --uses <name> | --defines <path> | --like <substr> |
+    // --calls <name> | --kind <k> (--list and --external are boolean)
+    "lang",
+    "exclude",
+    "uses",
+    "defines",
+    "like",
+    "calls",
+    "kind",
+    // init: explicit doc paths to import (comma-separated dirs and/or files),
+    // bypassing the auto-scan + y/N prompt.
+    "docs",
 ];
 
 #[derive(Debug, Default)]

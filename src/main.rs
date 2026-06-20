@@ -4,8 +4,10 @@
 
 mod chunk;
 mod cli;
+mod code;
 mod commands;
 mod config;
+mod deinit;
 mod embed;
 mod export;
 mod graph;
@@ -29,9 +31,9 @@ fn main() {
     if let Err(e) = run(&parsed) {
         eprintln!("error: {}", e.msg);
         if let Some(hint) = &e.hint {
-            eprintln!("\nпример:\n  {hint}");
+            eprintln!("\nexample:\n  {hint}");
         }
-        eprintln!("\nПолный контракт: `cm help`.");
+        eprintln!("\nFull contract: `cm help`.");
         std::process::exit(1);
     }
 }
@@ -48,13 +50,7 @@ fn run(p: &Parsed) -> Result<()> {
             Ok(())
         }
         "init" => init::run(p),
-        "mcp" => {
-            // Optional transport (desc.md §9); we don't ship it in this build.
-            eprintln!(
-                "MCP stdio mode is not built into this version. Use the CLI contract (`cm help`)."
-            );
-            std::process::exit(2);
-        }
+        "deinit" => deinit::run(p),
         other => {
             let dir = resolve_dir(p)?;
             let ctx = Ctx::new(&dir);
@@ -70,15 +66,17 @@ fn dispatch(cmd: &str, p: &Parsed, ctx: &Ctx) -> Result<()> {
         "get" => commands::get(p, ctx),
         "list" => commands::list(p, ctx),
         "related" => commands::related(p, ctx),
+        "backlinks" => commands::backlinks(p, ctx),
         "forget" => commands::forget(p, ctx),
         "import" => commands::import(p, ctx),
         "export" => commands::export(p, ctx),
         "reindex" => commands::reindex(p, ctx),
+        "map" => commands::map(p, ctx),
         "log" => commands::log(p, ctx),
         "config" => commands::config(p, ctx),
         unknown => Err(AppError::with_hint(
             format!("unknown command '{unknown}'"),
-            "Список команд: `cm help`.",
+            "command list: `cm help`.",
         )),
     }
 }
