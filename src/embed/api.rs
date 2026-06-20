@@ -13,7 +13,6 @@ pub struct ApiEmbedder {
     model: String,
     format: String,
     api_key: Option<String>,
-    #[allow(dead_code)] // only read back out through Embedder::dim
     dim: usize,
 }
 
@@ -43,7 +42,15 @@ impl ApiEmbedder {
             _ => json!({ "model": self.model, "input": text }),
         };
 
-        let mut req = ureq::post(&self.endpoint).set("Content-Type", "application/json");
+        // Bound every call: an endpoint that connects but never answers must not
+        // hang the whole process — this runs per-chunk inside import/reindex loops.
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(10))
+            .timeout_read(std::time::Duration::from_secs(60))
+            .build();
+        let mut req = agent
+            .post(&self.endpoint)
+            .set("Content-Type", "application/json");
         if let Some(key) = &self.api_key {
             req = req.set("Authorization", &format!("Bearer {key}"));
         }
@@ -59,7 +66,21 @@ impl ApiEmbedder {
             .into_json()
             .map_err(|e| AppError::new(format!("embedding API returned non-JSON: {e}")))?;
 
-        extract_vector(&resp, &self.format)
+        let vec = extract_vector(&resp, &self.format)?;
+        // Enforce the configured dimension: a misconfigured/compromised endpoint
+        // returning an oversized array would otherwise bloat every stored BLOB
+        // and contribute nothing to recall (cosine() returns 0.0 on a mismatch).
+        if self.dim > 0 && vec.len() != self.dim {
+            return Err(AppError::with_hint(
+                format!(
+                    "embedding API returned {} dimensions, expected {}",
+                    vec.len(),
+                    self.dim
+                ),
+                "Set embedding.dimension to the model's output size, or check the endpoint/model.",
+            ));
+        }
+        Ok(vec)
     }
 }
 

@@ -11,6 +11,11 @@ use std::path::Path;
 #[derive(Debug)]
 pub struct ImportResult {
     pub chunks: usize,
+    /// Name of the copy written under `imports/` (the `canonical_import_name`
+    /// result — usually the original basename, but it may carry a short `-<hash>`
+    /// suffix on a same-name/different-bytes collision). `init` records this in its
+    /// rollback manifest so `deinit` can find the copy to restore.
+    pub import_name: String,
 }
 
 /// Import a document. We copy the ORIGINAL into `imports/` as the source of truth
@@ -80,7 +85,10 @@ pub fn import_file(
     let mtime = mtime_secs(&dest);
     store.file_state_set(&source, "import", &source, &file_hash, mtime)?;
 
-    Ok(ImportResult { chunks })
+    Ok(ImportResult {
+        chunks,
+        import_name: dest_name,
+    })
 }
 
 /// (Re)derive and index all the chunk rows for ONE import from its `imports/`
@@ -240,7 +248,11 @@ fn html_to_text(html: &str) -> String {
 }
 
 fn strip_block(s: &str, open: &str, close: &str) -> String {
-    let lower = s.to_lowercase();
+    // ASCII-lowercase only: `open`/`close` are ASCII tag markers, and unlike
+    // `to_lowercase()` this is a byte-for-byte map, so offsets found in `lower`
+    // stay valid for slicing `s` (Unicode case folding can change byte length,
+    // e.g. 'İ', which would corrupt the slice and panic on a char boundary).
+    let lower = s.to_ascii_lowercase();
     let mut out = String::new();
     let mut i = 0;
     while i < s.len() {
@@ -347,6 +359,17 @@ mod tests {
         assert_eq!(
             strip_block("before<script>after", "<script", "</script>"),
             "before"
+        );
+    }
+
+    #[test]
+    fn strip_block_preserves_offsets_with_multibyte_chars() {
+        // 'İ' (U+0130) is 2 bytes but `to_lowercase()` expands it to 3 ("i̇"),
+        // which used to shift every offset after it and slice off a char
+        // boundary. ASCII-lowercasing keeps byte offsets aligned with `s`.
+        assert_eq!(
+            strip_block("İ<script>x</script>tail", "<script", "</script>"),
+            "İtail"
         );
     }
 

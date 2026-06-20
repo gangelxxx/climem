@@ -29,11 +29,22 @@ pub struct Ctx {
 
 impl Ctx {
     pub fn new(dir: &Path) -> Ctx {
+        // config.json sits in `dir` (next to the binary, or where --dir points).
+        // The DATA (store.db, notes/, imports/) lives under config's `data_dir`,
+        // which is relative to `dir` (or absolute). This lets the binary + config
+        // stay at the project root while data lives in a `memory/` subfolder.
+        // Backward compatible: a config without `data_dir` defaults to ".", and a
+        // missing/unreadable config falls back to the legacy single-folder layout.
+        let config_path = dir.join("config.json");
+        let data_dir = Config::load(&config_path)
+            .ok()
+            .map(|c| resolve_data_dir(dir, &c.data_dir))
+            .unwrap_or_else(|| dir.to_path_buf());
         Ctx {
-            store_path: dir.join("store.db"),
-            config_path: dir.join("config.json"),
-            notes_dir: dir.join("notes"),
-            imports_dir: dir.join("imports"),
+            store_path: data_dir.join("store.db"),
+            config_path,
+            notes_dir: data_dir.join("notes"),
+            imports_dir: data_dir.join("imports"),
         }
     }
 
@@ -44,6 +55,14 @@ impl Ctx {
 
     fn require_store(&self) -> Result<()> {
         if !self.store_path.exists() {
+            // A present-but-broken config.json mislocates the store (Ctx::new can't
+            // read data_dir, so it falls back to the legacy path). Surface THAT as the
+            // real cause instead of a misleading "no memory store at <wrong path>".
+            if self.config_path.is_file() {
+                // Re-parse to turn a parse failure into the precise error; if it
+                // parses fine, the store genuinely is missing.
+                Config::load(&self.config_path)?;
+            }
             return Err(AppError::with_hint(
                 format!("no memory store at {}", self.store_path.display()),
                 "Run `cm init <path>`, or point at an existing folder with --dir / MEMORY_DIR.",
@@ -57,6 +76,23 @@ impl Ctx {
         let cfg = Config::load(&self.config_path)?;
         let store = Store::open(&self.store_path)?;
         Ok((store, cfg))
+    }
+}
+
+/// Resolve config's `data_dir` (where store.db/notes/imports live) against the
+/// folder holding `config.json`. An absolute `data_dir` is used as-is; a relative
+/// one (the usual case: "." legacy, or "memory" for a split layout) joins onto
+/// `config_dir`. "" and "." both mean "same folder as config".
+pub(crate) fn resolve_data_dir(config_dir: &Path, data_dir: &str) -> PathBuf {
+    let trimmed = data_dir.trim();
+    if trimmed.is_empty() || trimmed == "." {
+        return config_dir.to_path_buf();
+    }
+    let p = Path::new(trimmed);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        config_dir.join(p)
     }
 }
 
@@ -138,7 +174,7 @@ pub fn remember(p: &Parsed, ctx: &Ctx) -> Result<()> {
     if body.trim().is_empty() {
         return Err(AppError::with_hint(
             "remember reads the note body from stdin, but stdin was empty",
-            "echo \"Решили: авторизация на JWT\" | cm remember --tags auth,decision",
+            "echo \"Decision: use JWT for auth\" | cm remember --tags auth,decision",
         ));
     }
     let tags = p.value("tags").unwrap_or("");
@@ -234,7 +270,7 @@ pub fn recall(p: &Parsed, ctx: &Ctx) -> Result<()> {
     let query = p.arg(0).or_else(|| p.value("query")).ok_or_else(|| {
         AppError::with_hint(
             "recall needs a query",
-            "cm recall \"как устроена авторизация\" --limit 5",
+            "cm recall \"how is auth structured\" --limit 5",
         )
     })?;
     let limit = parse_limit(p.value("limit"), 5)?;
@@ -243,6 +279,14 @@ pub fn recall(p: &Parsed, ctx: &Ctx) -> Result<()> {
         Some(s) if !s.is_empty() => Some(parse_fields(s, output::RECALL_FIELDS)?),
         _ => None,
     };
+    // `--explain` only adds the score scalars in the default (no --fields) shape;
+    // with an explicit --fields list it would be a silent no-op, so say so.
+    if explain && fields.is_some() {
+        eprintln!(
+            "warning: --explain has no effect with --fields; \
+             add score,fts,vector,graph to --fields to see those scalars"
+        );
+    }
     let opts = RecallOpts {
         limit,
         tag: p.value("tag").filter(|s| !s.is_empty()),
@@ -739,6 +783,453 @@ fn count_md_files(dir: &Path) -> usize {
         .unwrap_or(0)
 }
 
+// ---- map (source-code graph; feature `code`) ------------------------------
+
+/// `cm map` drives the code-only knowledge graph (kept separate from the notes
+/// graph: its own code_* tables, reached only here). It has two shapes: an INDEX
+/// shape `cm map <path> [--lang L] [--exclude SUBSTR]`, and a QUERY shape
+/// `cm map --query <name> | --uses <name> | --defines <path>`. The query modes are
+/// read-only; the index mode parses the source tree with tree-sitter and (re)builds
+/// the code graph incrementally by content hash.
+pub fn map(p: &Parsed, ctx: &Ctx) -> Result<()> {
+    let (store, _cfg) = ctx.open()?;
+
+    // --- query modes (read-only; no parsing, so they work even without the
+    //     `code` feature, since the graph is just rows once built) ---
+    // A shared `--kind` filter narrows the symbol-listing modes to one tag kind
+    // (function/method/class/...). It does not apply to --uses/--calls (those key
+    // off a name, not a kind). `--tests` opts test-defined symbols back IN — by
+    // default they're hidden so listings show a module's real API, not its tests.
+    let kind = p.value("kind");
+    let tests = p.has("tests");
+    if let Some(name) = p.value("query") {
+        for s in filter_kind(store.code_symbols_by_name(name, tests)?, kind) {
+            print_line(&code_symbol_value(&s));
+        }
+        return Ok(());
+    }
+    if let Some(needle) = p.value("like") {
+        for s in filter_kind(store.code_symbols_like(needle, tests)?, kind) {
+            print_line(&code_symbol_value(&s));
+        }
+        return Ok(());
+    }
+    if p.has("list") {
+        // `--list` with no value = whole graph; an optional `--kind` narrows it.
+        for s in store.code_list(kind, tests)? {
+            print_line(&code_symbol_value(&s));
+        }
+        return Ok(());
+    }
+    if let Some(name) = p.value("uses") {
+        for (caller, line) in store.code_callers_of(name, tests)? {
+            print_line(&json!({
+                "name": caller.name,
+                "kind": caller.kind,
+                "path": caller.path,
+                "line": line,            // where the use occurs
+                "def_line": caller.line, // where the caller itself is defined
+            }));
+        }
+        return Ok(());
+    }
+    if let Some(name) = p.value("calls") {
+        // Outgoing dependencies. Resolved-only by default (unresolved = external /
+        // stdlib names, which are the bulk); --external surfaces those too.
+        let resolved_only = !p.has("external");
+        for (target, line, resolved) in store.code_callees_of(name, resolved_only)? {
+            print_line(&json!({
+                "calls": target,
+                "line": line,
+                "resolved": resolved, // true = links to an in-project definition
+            }));
+        }
+        return Ok(());
+    }
+    if let Some(path) = p.value("defines") {
+        let key = normalize_code_path(path);
+        for s in filter_kind(store.code_symbols_in_like(&key, tests)?, kind) {
+            print_line(&code_symbol_value(&s));
+        }
+        return Ok(());
+    }
+
+    // --- index mode ---
+    let root = p.arg(0).ok_or_else(|| {
+        AppError::with_hint(
+            "map needs a path to index, or a query flag",
+            "cm map ./src   (or: cm map --query <name> | --uses <name> | --defines <file>)",
+        )
+    })?;
+    let root = Path::new(root);
+    if !root.exists() {
+        return Err(AppError::with_hint(
+            format!("no such path: {}", root.display()),
+            "cm map ./src",
+        ));
+    }
+    let mem_dir = ctx
+        .store_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+
+    let stats = map_tree(&store, root, &mem_dir, p.value("lang"), p.value("exclude"))?;
+    store.log_op("map", Some(&root.to_string_lossy()))?;
+
+    let (n_files, n_symbols, n_edges) = store.code_counts()?;
+    print_line(&json!({
+        "mapped": root.to_string_lossy(),
+        "scanned": stats.scanned,
+        "changed": stats.changed,
+        "files": n_files,
+        "symbols": n_symbols,
+        "edges": n_edges,
+    }));
+    Ok(())
+}
+
+/// Outcome of indexing a source tree into the code graph.
+pub(crate) struct MapStats {
+    /// Source files actually fed to a grammar (extension recognized).
+    pub scanned: usize,
+    /// Files whose graph rows were (re)written this run, plus pruned-file deltas.
+    pub changed: usize,
+    /// Files seen during the walk whose extension has no grammar (skipped silently
+    /// before — now reported so the user knows what wasn't indexed).
+    pub no_grammar: usize,
+    /// Files a grammar rejected (parse error); their content isn't in the graph.
+    pub unparsed: usize,
+    /// Per-language scanned-file counts, for a "C# 57, Rust 8" breakdown. Sorted
+    /// by count (desc) when rendered.
+    pub by_lang: std::collections::BTreeMap<&'static str, usize>,
+}
+
+/// Index a source tree into the code graph: walk `root` (skipping build/vendor
+/// dirs, the memory folder `mem_dir`, and anything matching `exclude`), parse each
+/// changed source file (incremental by content hash), prune vanished files, then
+/// resolve `uses` edges by name. Shared by `cm map` and `cm init --code`. Does NOT
+/// log the op or print — callers decide that. Propagates the no-`code`-feature
+/// rebuild hint so the caller can surface (map) or downgrade (init) it.
+pub(crate) fn map_tree(
+    store: &Store,
+    root: &Path,
+    mem_dir: &Path,
+    lang_filter: Option<&str>,
+    exclude: Option<&str>,
+) -> Result<MapStats> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    collect_source_files(root, mem_dir, exclude, &mut files);
+    files.sort();
+
+    let mut scanned = 0usize;
+    let mut changed = 0usize;
+    let mut no_grammar = 0usize;
+    let mut unparsed = 0usize;
+    let mut by_lang: std::collections::BTreeMap<&'static str, usize> = Default::default();
+    for path in &files {
+        let lang = match crate::code::lang_for_path(path) {
+            Some(l) => l,
+            None => {
+                // Walked in (e.g. via is_source_file) but no grammar owns the ext.
+                no_grammar += 1;
+                continue;
+            }
+        };
+        if let Some(want) = lang_filter {
+            if want != lang {
+                continue;
+            }
+        }
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("warning: cannot read {}: {e}", path.display());
+                continue;
+            }
+        };
+        let rel = rel_code_path(root, path);
+        let hash = content_hash_hex(&bytes);
+        scanned += 1;
+        *by_lang.entry(lang).or_insert(0) += 1;
+        if let Some((old, _)) = store.code_file_state(&rel)? {
+            if old == hash {
+                continue; // unchanged since last map
+            }
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        let parsed = match crate::code::parse(&rel, lang, &text) {
+            Ok(pp) => pp,
+            Err(e) => {
+                // Without the `code` feature this is THE place the rebuild hint
+                // surfaces; propagate it so the caller can react.
+                if e.hint.is_some() {
+                    return Err(e);
+                }
+                eprintln!("warning: parse failed for {rel}: {}", e.msg);
+                unparsed += 1;
+                continue;
+            }
+        };
+        index_code_file(store, &rel, lang, &hash, mtime_secs(path), &parsed)?;
+        changed += 1;
+    }
+
+    // Prune files that vanished from disk, re-dangling inbound uses-edges so a
+    // later map revives them if the symbol reappears (mirrors note pruning).
+    for rel in store.code_file_paths()? {
+        let abs = root.join(&rel);
+        if !abs.exists() {
+            for s in store.code_symbols_in(&rel)? {
+                store.dangle_code_edges_to(&s.symbol_id)?;
+            }
+            store.delete_code_file(&rel)?;
+            changed += 1;
+        }
+    }
+
+    // Second pass: resolve uses-edges by name against the FULL symbol table, so a
+    // call to a symbol defined in another file (or a file mapped later this run)
+    // links up. Anything unresolved stays dangling and revives on a later map.
+    let name_map = store.code_symbol_name_map()?;
+    for src in store.dangling_code_sources()? {
+        resolve_code_uses(store, &src, &name_map)?;
+    }
+
+    Ok(MapStats {
+        scanned,
+        changed,
+        no_grammar,
+        unparsed,
+        by_lang,
+    })
+}
+
+/// Render `by_lang` as a compact "C# 57, Rust 8, TypeScript 4" string, biggest
+/// first, with the registry's display names. Empty → "—".
+pub(crate) fn lang_breakdown(by_lang: &std::collections::BTreeMap<&'static str, usize>) -> String {
+    if by_lang.is_empty() {
+        return "—".to_string();
+    }
+    let mut pairs: Vec<(&&str, &usize)> = by_lang.iter().collect();
+    // Count desc, then name asc for a stable tie-break.
+    pairs.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    pairs
+        .iter()
+        .map(|(lang, n)| format!("{} {}", crate::code::display_lang(lang), n))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Write one source file's symbols and edges into the code graph. Replaces any
+/// prior data for the file first (so an edit doesn't leave stale symbols), then
+/// inserts each definition (+ a `defines` edge from the file) and each reference
+/// (a `uses` edge from the enclosing — best-effort — symbol, resolved by name in
+/// the second pass). Inbound uses-edges to the file's old symbols are re-dangled.
+fn index_code_file(
+    store: &Store,
+    rel: &str,
+    lang: &str,
+    hash: &str,
+    mtime: i64,
+    parsed: &crate::code::CodeParse,
+) -> Result<()> {
+    // Re-dangle inbound edges that pointed at this file's current symbols, then
+    // drop the file's old rows before re-inserting (idempotent re-map).
+    for s in store.code_symbols_in(rel)? {
+        store.dangle_code_edges_to(&s.symbol_id)?;
+    }
+    store.delete_code_file(rel)?;
+    store.upsert_code_file(rel, lang, hash, mtime)?;
+
+    // Definitions become symbol nodes + a `defines` edge from the file path.
+    // We also build a line-sorted index of (line, symbol_id) so a reference can
+    // be attributed to the definition it sits inside (the nearest def starting at
+    // or before the ref's line). This is a cheap heuristic, not real scoping.
+    let mut def_spans: Vec<(usize, String)> = Vec::new();
+    for d in &parsed.defs {
+        let sid = crate::code::symbol_id(rel, &d.kind, &d.name, d.line);
+        store.insert_code_symbol(
+            &sid,
+            rel,
+            &d.name,
+            &d.kind,
+            d.line as i64,
+            Some(&d.signature),
+            d.is_test,
+        )?;
+        store.insert_code_edge(rel, "defines", Some(&sid), &d.name, d.line as i64)?;
+        def_spans.push((d.line, sid));
+    }
+    def_spans.sort();
+
+    // References become `uses` edges. The edge's src is the enclosing definition
+    // (so `--uses X` can say WHICH symbol uses X); if a ref sits before any def
+    // (top-level code), we attribute it to the file path itself.
+    for r in &parsed.refs {
+        let src = enclosing_symbol(&def_spans, r.line).unwrap_or_else(|| rel.to_string());
+        // dst resolved in the second pass; insert dangling with the verbatim name.
+        store.insert_code_edge(&src, "uses", None, &r.name, r.line as i64)?;
+    }
+    Ok(())
+}
+
+/// The symbol_id of the definition that encloses `line`: the one with the largest
+/// start line ≤ `line`. `def_spans` must be sorted by line ascending.
+fn enclosing_symbol(def_spans: &[(usize, String)], line: usize) -> Option<String> {
+    let mut found = None;
+    for (start, sid) in def_spans {
+        if *start <= line {
+            found = Some(sid.clone());
+        } else {
+            break;
+        }
+    }
+    found
+}
+
+/// Resolve a source's dangling `uses` edges by name against the symbol table.
+fn resolve_code_uses(
+    store: &Store,
+    src: &str,
+    name_map: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    for e in store_code_uses_from(store, src)? {
+        if e.dst.is_none() {
+            // Never resolve a ubiquitous stdlib method name to a same-named project
+            // symbol — that's the main false-positive source for --calls/--uses.
+            if crate::code::is_stdlib_combinator(&e.dst_raw) {
+                continue;
+            }
+            if let Some(target) = name_map.get(&e.dst_raw) {
+                // Don't link a symbol to itself (a recursive call shouldn't count).
+                if target != src {
+                    store.resolve_code_edge(src, &e.dst_raw, target)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Small read helper: a source's `uses` edges (we only need src/dst/dst_raw here).
+fn store_code_uses_from(store: &Store, src: &str) -> Result<Vec<crate::store::CodeEdgeRow>> {
+    let mut stmt = store.conn.prepare(
+        "SELECT src, predicate, dst, dst_raw, line FROM code_edges
+         WHERE src = ?1 AND predicate = 'uses'",
+    )?;
+    let rows = stmt
+        .query_map([src], |r| {
+            Ok(crate::store::CodeEdgeRow {
+                src: r.get(0)?,
+                predicate: r.get(1)?,
+                dst: r.get(2)?,
+                dst_raw: r.get(3)?,
+                line: r.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Keep only symbols of a given tag kind (function/method/class/...), or all of
+/// them when no `--kind` was given. Done in Rust, not SQL, so every symbol-listing
+/// mode shares one filter regardless of which store query produced the rows.
+fn filter_kind(
+    rows: Vec<crate::store::CodeSymbolRow>,
+    kind: Option<&str>,
+) -> Vec<crate::store::CodeSymbolRow> {
+    match kind {
+        Some(k) => rows.into_iter().filter(|s| s.kind == k).collect(),
+        None => rows,
+    }
+}
+
+/// JSON projection of a code symbol (omit a null/empty signature to stay lean).
+fn code_symbol_value(s: &crate::store::CodeSymbolRow) -> serde_json::Value {
+    let mut v = json!({
+        "name": s.name,
+        "kind": s.kind,
+        "path": s.path,
+        "line": s.line,
+    });
+    if let Some(sig) = &s.signature {
+        if !sig.is_empty() {
+            v["signature"] = json!(sig);
+        }
+    }
+    v
+}
+
+/// Relative, '/'-separated path of a source file under the mapped root. Falls back
+/// to the file name if it isn't under root (shouldn't happen via our walk).
+fn rel_code_path(root: &Path, path: &Path) -> String {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    normalize_code_path(&rel.to_string_lossy())
+}
+
+/// Normalize a path key to forward slashes so Windows and Unix agree on the keys
+/// stored in code_files / queried by `--defines`.
+fn normalize_code_path(p: &str) -> String {
+    p.replace('\\', "/")
+}
+
+/// Directory names we never descend into when mapping a source tree: build output,
+/// vendored deps, VCS metadata, and a few common heavy/irrelevant folders.
+const SKIP_DIRS: &[&str] = &[
+    "target",       // Rust
+    "node_modules", // JS/TS
+    ".git",
+    ".hg",
+    ".svn",
+    "dist",
+    "build", // generic / Gradle
+    "out",
+    "vendor",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".idea",
+    ".vscode",
+    "obj", // .NET — generated C# (obj/Debug/*.cs etc.)
+    "bin", // .NET — build output
+];
+
+/// Recursively gather source files under `dir`, skipping SKIP_DIRS, the memory
+/// folder, dotfiles-dirs, anything matching `exclude` (a plain substring of the
+/// path), and any non-source extension. Best-effort: unreadable entries are
+/// skipped. No `walkdir` dep — a small hand-rolled walk (CLAUDE.md: minimal deps).
+fn collect_source_files(dir: &Path, mem_dir: &Path, exclude: Option<&str>, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        let Ok(ft) = entry.file_type() else { continue };
+        if let Some(ex) = exclude {
+            if !ex.is_empty() && path.to_string_lossy().contains(ex) {
+                continue;
+            }
+        }
+        if ft.is_dir() {
+            // Skip the memory folder (its store/binary aren't project source).
+            if path == mem_dir {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            if SKIP_DIRS.contains(&name) {
+                continue;
+            }
+            collect_source_files(&path, mem_dir, exclude, out);
+        } else if ft.is_file() && crate::code::is_source_file(&path) {
+            out.push(path);
+        }
+    }
+}
+
 // ---- export --------------------------------------------------------------
 
 pub fn export(p: &Parsed, ctx: &Ctx) -> Result<()> {
@@ -749,8 +1240,17 @@ pub fn export(p: &Parsed, ctx: &Ctx) -> Result<()> {
 
     let rows = if let Some(query) = p.value("query") {
         let emb = embed::build(&cfg)?;
-        let limit = parse_limit(p.value("limit"), 50)?;
-        search::recall(&store, emb.as_ref(), &cfg, query, limit)?
+        // Honor the same pre-filters as `recall` so the two read paths don't
+        // diverge: a flag learned on `recall` (--tag/--origin-prefix/--min-score)
+        // applies here too. --limit defaults to 50 for a query export.
+        let opts = RecallOpts {
+            limit: parse_limit(p.value("limit"), 50)?,
+            tag: p.value("tag").filter(|s| !s.is_empty()),
+            origin_prefix: p.value("origin-prefix").filter(|s| !s.is_empty()),
+            min_score: parse_score(p.value("min-score"))?,
+            related: p.value("related").filter(|s| !s.is_empty()),
+        };
+        search::recall_with(&store, emb.as_ref(), &cfg, query, &opts)?
             .into_iter()
             .map(|h| h.row)
             .collect()
@@ -796,6 +1296,15 @@ pub fn log(p: &Parsed, ctx: &Ctx) -> Result<()> {
 // ---- config --------------------------------------------------------------
 
 pub fn config(p: &Parsed, ctx: &Ctx) -> Result<()> {
+    // Check the config file first: in the split layout it carries `data_dir`, so a
+    // missing config is the more fundamental problem (the store can't even be
+    // located). A clear "config.json not found" beats a downstream "no memory store".
+    if !ctx.config_path.is_file() {
+        return Err(AppError::with_hint(
+            format!("config.json not found at {}", ctx.config_path.display()),
+            "Run `cm init <path>`, or point at the folder holding config.json with --dir.",
+        ));
+    }
     ctx.require_store()?;
     let path = &ctx.config_path;
     let sub = p.arg(0);
@@ -901,7 +1410,7 @@ fn parse_fields(arg: &str, allowed: &[&str]) -> Result<Vec<String>> {
     if fields.is_empty() {
         return Err(AppError::with_hint(
             "--fields needs at least one field name",
-            "cm recall \"тема\" --fields id,body",
+            "cm recall \"topic\" --fields id,body",
         ));
     }
     for f in &fields {
@@ -923,7 +1432,7 @@ fn parse_score(arg: Option<&str>) -> Result<f32> {
         Some(s) => s.parse::<f32>().map_err(|_| {
             AppError::with_hint(
                 format!("--min-score must be a number, got '{s}'"),
-                "cm recall \"тема\" --min-score 0.01",
+                "cm recall \"topic\" --min-score 0.01",
             )
         }),
     }
@@ -1522,5 +2031,103 @@ mod tests {
         let ctx = Ctx::new(dir.path());
         let err = recall(&parsed(&["recall", "query"]), &ctx).unwrap_err();
         assert!(err.msg.contains("endpoint is not set"));
+    }
+
+    #[test]
+    fn resolve_data_dir_joins_relative_keeps_absolute_and_dot() {
+        let root = Path::new("/proj");
+        // "." and "" mean "same folder as config".
+        assert_eq!(resolve_data_dir(root, "."), PathBuf::from("/proj"));
+        assert_eq!(resolve_data_dir(root, ""), PathBuf::from("/proj"));
+        assert_eq!(resolve_data_dir(root, "  "), PathBuf::from("/proj"));
+        // A relative dir joins onto the config folder.
+        assert_eq!(
+            resolve_data_dir(root, "memory"),
+            PathBuf::from("/proj/memory")
+        );
+        // An absolute dir is used as-is.
+        assert_eq!(
+            resolve_data_dir(root, "/data/store"),
+            PathBuf::from("/data/store")
+        );
+    }
+
+    #[test]
+    fn ctx_splits_config_at_root_and_data_under_data_dir() {
+        // config.json at the root with data_dir="memory" → store under root/memory.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let cfg = Config {
+            data_dir: "memory".into(),
+            ..Config::default()
+        };
+        cfg.save(&root.join("config.json")).unwrap();
+        let ctx = Ctx::new(root);
+        assert_eq!(ctx.config_path, root.join("config.json"));
+        assert_eq!(ctx.store_path, root.join("memory").join("store.db"));
+        assert_eq!(ctx.notes_dir, root.join("memory").join("notes"));
+    }
+
+    #[test]
+    fn ctx_legacy_single_folder_when_no_config() {
+        // No config.json → fall back to the legacy single-folder layout (data next
+        // to where we were pointed), so old stores keep working.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let ctx = Ctx::new(dir);
+        assert_eq!(ctx.store_path, dir.join("store.db"));
+        assert_eq!(ctx.config_path, dir.join("config.json"));
+    }
+
+    #[test]
+    fn malformed_config_surfaces_parse_error_not_no_store() {
+        // Regression: a split-layout store (real store under memory/) whose config
+        // got corrupted. Ctx::new can't read data_dir, so it falls back to the legacy
+        // path and store_path points at the (absent) root store.db. require_store must
+        // surface "config.json is invalid", not a misleading "no memory store".
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("config.json"), "{ this is not json").unwrap();
+        // The real store lives under memory/ (mimicking a split layout).
+        std::fs::create_dir_all(root.join("memory")).unwrap();
+        Store::create(&root.join("memory").join("store.db")).unwrap();
+        let ctx = Ctx::new(root);
+        let err = get(&parsed(&["get", "1"]), &ctx).unwrap_err();
+        assert!(
+            err.msg.contains("config.json is invalid"),
+            "expected parse error, got: {}",
+            err.msg
+        );
+    }
+
+    #[test]
+    fn lang_breakdown_orders_by_count_then_name_with_pretty_names() {
+        let mut m: std::collections::BTreeMap<&'static str, usize> = Default::default();
+        m.insert("csharp", 57);
+        m.insert("rust", 8);
+        m.insert("typescript", 8); // ties with rust on count -> name asc (rust first)
+        assert_eq!(lang_breakdown(&m), "C# 57, Rust 8, TypeScript 8");
+        assert_eq!(lang_breakdown(&Default::default()), "—");
+    }
+
+    #[test]
+    fn skip_dirs_excludes_dotnet_obj_and_bin() {
+        // The .NET generated dirs must not be walked (obj/Debug/*.cs is generated
+        // noise that previously inflated the file count).
+        let tmp = TempDir::new().unwrap();
+        let d = tmp.path();
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::create_dir_all(d.join("obj/Debug")).unwrap();
+        std::fs::create_dir_all(d.join("bin")).unwrap();
+        std::fs::write(d.join("src/A.cs"), "class A {}").unwrap();
+        std::fs::write(d.join("obj/Debug/G.cs"), "class G {}").unwrap();
+        std::fs::write(d.join("bin/B.cs"), "class B {}").unwrap();
+        let mut out = Vec::new();
+        collect_source_files(d, Path::new("/no/mem"), None, &mut out);
+        let names: Vec<String> = out
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["A.cs"], "obj/ and bin/ must be skipped");
     }
 }

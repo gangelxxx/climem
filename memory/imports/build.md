@@ -79,9 +79,19 @@ python scripts/bench.py --kb ./memory --limit 5 --bin target/release/cm.exe
 |------|:---:|----------|--------|
 | `api` | **да** (`default = ["api"]`) | `dep:ureq` | Провайдер `api` (нейро-эмбеддинги по HTTP). Включён в дефолт, чтобы переключение на нейромодель было **рантайм-конфигом**, без пересборки. |
 | `pdf` | нет | `dep:pdf-extract` | Импорт/экспорт PDF. Выключен — тяжёлое дерево зависимостей. |
+| `code` | нет | `dep:tree-sitter`, `dep:tree-sitter-tags` + 11 грамматик (`tree-sitter-rust/python/javascript/typescript/go/java/c/cpp/c-sharp/ruby/php`) | Граф кода (команда `cm map`): парсинг исходников tree-sitter'ом, извлечение defines/uses через `tags.scm` каждой грамматики. Выключен — тяжёлое дерево + вес бинаря (грамматики статически линкуются). |
 
 Без фичи `api` провайдер `api` даёт понятную ошибку с подсказкой пересобрать (`embed::build`).
 Без `pdf` — то же для PDF (`import::pdf_chunks`, `export::render`).
+Без `code` — `cm map` даёт ту же self-heal ошибку (`code::parse` fallback под `#[cfg(not(feature="code"))]`).
+
+**Совместимость версий tree-sitter:** ядро `tree-sitter` 0.26, грамматики — 0.23–0.25; они
+не конфликтуют по ABI, потому что мост — общий крейт `tree-sitter-language` (грамматика
+экспортирует `LANGUAGE: LanguageFn` + `TAGS_QUERY: &str`, ядро принимает через `.into()`).
+Сборка с `code`: `cargo build --release --features code`. **Bash сознательно НЕ включён** —
+у грамматики нет `tags.scm` (нет графа символов); css/html — разметка, тоже исключены.
+**Добавить язык** = крейт-грамматика в `Cargo.toml` + строка в `code::LANGUAGES` (код
+извлечения не меняется — поток тегов унифицирован).
 
 ## Профиль release (`Cargo.toml [profile.release]`)
 

@@ -4,6 +4,7 @@
 
 mod chunk;
 mod cli;
+mod code;
 mod commands;
 mod config;
 mod deinit;
@@ -30,9 +31,9 @@ fn main() {
     if let Err(e) = run(&parsed) {
         eprintln!("error: {}", e.msg);
         if let Some(hint) = &e.hint {
-            eprintln!("\nпример:\n  {hint}");
+            eprintln!("\nexample:\n  {hint}");
         }
-        eprintln!("\nПолный контракт: `cm help`.");
+        eprintln!("\nFull contract: `cm help`.");
         std::process::exit(1);
     }
 }
@@ -70,11 +71,12 @@ fn dispatch(cmd: &str, p: &Parsed, ctx: &Ctx) -> Result<()> {
         "import" => commands::import(p, ctx),
         "export" => commands::export(p, ctx),
         "reindex" => commands::reindex(p, ctx),
+        "map" => commands::map(p, ctx),
         "log" => commands::log(p, ctx),
         "config" => commands::config(p, ctx),
         unknown => Err(AppError::with_hint(
             format!("unknown command '{unknown}'"),
-            "Список команд: `cm help`.",
+            "command list: `cm help`.",
         )),
     }
 }

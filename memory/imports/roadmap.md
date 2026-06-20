@@ -17,6 +17,7 @@
 |-------|--------|-----|---------|
 | **md как источник правды + `reindex`** | **DONE (2026-06-17)** | `note.rs`, `commands::reindex`, таблица `sync` | `desc.md §3/§10`. `store.db` стал производным/пересобираемым; правда — `notes/`+`imports/`. Инкрементально по `content_hash`. |
 | **Граф знаний** (`relations` + `[[ссылки]]`) | **DONE (2026-06-17)** | `graph.rs`, таблица `edges`, `commands::related` | `desc.md §3/§12`. Выводится из md, разрешение по `slug`/`id:`, висячие цели first-class. |
+| **Граф кода** (tree-sitter, `cm map`) | **DONE (2026-06-18)** | `code.rs`, таблицы `code_*`, `commands::map`, фича `code` | ОТДЕЛЬНЫЙ от графа заметок (решение — [decisions.md](decisions.md)). 11 языков через `tree-sitter-tags`+`tags.scm`. Узлы файлы/символы, рёбра `defines`/`uses` (резолв по имени, висячие first-class). Запросы `--query`/`--uses`/`--defines`. Исходники не копируются. |
 
 ## Доделано после миграции md-as-truth (2026-06-17)
 

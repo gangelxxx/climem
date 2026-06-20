@@ -46,6 +46,30 @@ pub struct EdgeRow {
     pub source: String,
 }
 
+/// One source-code symbol definition (feature `code`). Mirrors a row of
+/// `code_symbols`; `symbol_id` is the content-addressed key other edges resolve to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodeSymbolRow {
+    pub symbol_id: String,
+    pub path: String,
+    pub name: String,
+    pub kind: String,
+    pub line: i64,
+    pub signature: Option<String>,
+    pub is_test: bool,
+}
+
+/// One source-code graph edge (feature `code`): `defines` (file → symbol) or
+/// `uses` (symbol → symbol). `dst` is the resolved symbol_id or `None` (dangling).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodeEdgeRow {
+    pub src: String,
+    pub predicate: String,
+    pub dst: Option<String>,
+    pub dst_raw: String,
+    pub line: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct ImportRow {
     /// Canonical `imports/<name>` path (relative to the memory folder).
@@ -126,6 +150,55 @@ CREATE TABLE IF NOT EXISTS edges (
 );
 CREATE INDEX IF NOT EXISTS edges_src ON edges(src_id);
 CREATE INDEX IF NOT EXISTS edges_dst ON edges(dst_id);
+
+-- ============================================================================
+-- SOURCE-CODE GRAPH (feature `code`) — DELIBERATELY SEPARATE from the notes
+-- graph above. Code lives in its own code_* tables and is queried only through
+-- `cm map`; it never mixes into notes/notes_fts/edges, so `recall`/`related`
+-- stay byte-identical. All three tables are pure derived cache over the live
+-- working tree (the source files themselves are the truth; nothing is copied
+-- into the memory folder), so they wipe+rebuild from disk like the rest.
+-- ============================================================================
+
+-- One row per indexed source file. content_hash drives incremental `cm map`
+-- (an unchanged file is skipped) exactly like `sync` does for notes.
+CREATE TABLE IF NOT EXISTS code_files (
+  path         TEXT PRIMARY KEY,   -- path relative to the mapped root, '/'-separated
+  lang         TEXT NOT NULL,      -- registry name: 'rust', 'python', ...
+  content_hash TEXT NOT NULL,
+  mtime        INTEGER NOT NULL,
+  indexed_at   INTEGER NOT NULL
+);
+
+-- One row per symbol DEFINITION (a tree-sitter-tags @definition.*). symbol_id is
+-- content-addressed (hash of path+kind+name+line) so it's stable across rebuilds.
+CREATE TABLE IF NOT EXISTS code_symbols (
+  symbol_id  TEXT PRIMARY KEY,
+  path       TEXT NOT NULL,        -- file it's defined in (FK-ish -> code_files.path)
+  name       TEXT NOT NULL,        -- 'Store', 'upsert_note'
+  kind       TEXT NOT NULL,        -- tags syntax_type: 'function','struct','class',...
+  line       INTEGER NOT NULL,     -- 1-based line of the definition
+  signature  TEXT,                 -- first line of the definition, trimmed
+  is_test    INTEGER NOT NULL DEFAULT 0  -- 1 = defined in test code (hidden by default)
+);
+CREATE INDEX IF NOT EXISTS code_symbols_name ON code_symbols(name);
+CREATE INDEX IF NOT EXISTS code_symbols_path ON code_symbols(path);
+
+-- Graph edge in the code graph. predicate is 'defines' (file path -> symbol) or
+-- 'uses' (referencing symbol_id -> referenced symbol). dst is the resolved target
+-- symbol_id, or NULL when a referenced name doesn't resolve (dangling, revived on
+-- a later map pass — same first-class-dangling trick as the notes graph). dst_raw
+-- keeps the verbatim referenced name so wipe+rebuild reproduces the table.
+CREATE TABLE IF NOT EXISTS code_edges (
+  src       TEXT NOT NULL,         -- file path (defines) or symbol_id (uses)
+  predicate TEXT NOT NULL CHECK(predicate IN ('defines','uses')),
+  dst       TEXT,                  -- resolved symbol_id, or NULL = dangling
+  dst_raw   TEXT NOT NULL,         -- verbatim target name / symbol_id
+  line      INTEGER NOT NULL,      -- 1-based line where the edge originates
+  PRIMARY KEY (src, predicate, dst_raw, line)
+);
+CREATE INDEX IF NOT EXISTS code_edges_src ON code_edges(src);
+CREATE INDEX IF NOT EXISTS code_edges_dst ON code_edges(dst);
 "#;
 
 impl Store {
@@ -630,18 +703,401 @@ impl Store {
         Ok(n)
     }
 
+    // ---- code graph (feature `code`; separate from the notes graph) ------
+
+    /// The `(content_hash, mtime)` we last indexed for a source file, or `None`.
+    /// Drives incremental `cm map` exactly like `file_state_get` does for notes.
+    pub fn code_file_state(&self, path: &str) -> Result<Option<(String, i64)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT content_hash, mtime FROM code_files WHERE path = ?1",
+                params![path],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// Record (or refresh) a source file's indexed state.
+    pub fn upsert_code_file(
+        &self,
+        path: &str,
+        lang: &str,
+        content_hash: &str,
+        mtime: i64,
+    ) -> Result<()> {
+        let (epoch, _) = now();
+        self.conn.execute(
+            "INSERT INTO code_files(path, lang, content_hash, mtime, indexed_at)
+             VALUES(?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(path) DO UPDATE SET
+               lang = excluded.lang, content_hash = excluded.content_hash,
+               mtime = excluded.mtime, indexed_at = excluded.indexed_at",
+            params![path, lang, content_hash, mtime, epoch],
+        )?;
+        Ok(())
+    }
+
+    /// Every indexed source path (sorted) — used to prune files that vanished.
+    pub fn code_file_paths(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path FROM code_files ORDER BY path")?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Drop a source file and everything derived from it: its definitions, the
+    /// `defines` edges from the file, and the `uses` edges out of its symbols.
+    /// (Inbound `uses` edges that pointed at those symbols are re-dangled by
+    /// `dangle_code_edges_to` in the caller, mirroring the notes-graph trick.)
+    pub fn delete_code_file(&self, path: &str) -> Result<()> {
+        // uses-edges originate from this file's symbols (src = symbol_id).
+        self.conn.execute(
+            "DELETE FROM code_edges WHERE predicate = 'uses' AND src IN
+               (SELECT symbol_id FROM code_symbols WHERE path = ?1)",
+            params![path],
+        )?;
+        // defines-edges originate from the file path itself.
+        self.conn.execute(
+            "DELETE FROM code_edges WHERE predicate = 'defines' AND src = ?1",
+            params![path],
+        )?;
+        self.conn
+            .execute("DELETE FROM code_symbols WHERE path = ?1", params![path])?;
+        self.conn
+            .execute("DELETE FROM code_files WHERE path = ?1", params![path])?;
+        Ok(())
+    }
+
+    /// Insert a symbol definition (PK dedups, so re-running is idempotent).
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_code_symbol(
+        &self,
+        symbol_id: &str,
+        path: &str,
+        name: &str,
+        kind: &str,
+        line: i64,
+        signature: Option<&str>,
+        is_test: bool,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO code_symbols(symbol_id, path, name, kind, line, signature, is_test)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![symbol_id, path, name, kind, line, signature, is_test as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Insert a code edge (`defines`/`uses`). PK dedups identical edges.
+    pub fn insert_code_edge(
+        &self,
+        src: &str,
+        predicate: &str,
+        dst: Option<&str>,
+        dst_raw: &str,
+        line: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO code_edges(src, predicate, dst, dst_raw, line)
+             VALUES(?1, ?2, ?3, ?4, ?5)",
+            params![src, predicate, dst, dst_raw, line],
+        )?;
+        Ok(())
+    }
+
+    /// Re-dangle every `uses` edge pointing at a now-removed symbol_id, keeping
+    /// `dst_raw` so it re-resolves when a symbol with that name reappears.
+    pub fn dangle_code_edges_to(&self, dst: &str) -> Result<usize> {
+        let n = self.conn.execute(
+            "UPDATE code_edges SET dst = NULL WHERE dst = ?1",
+            params![dst],
+        )?;
+        Ok(n)
+    }
+
+    /// `(name -> symbol_id)` for every definition, used to resolve `uses` targets
+    /// by name. A name defined more than once keeps the lowest symbol_id (stable,
+    /// deterministic — mirrors the slug-collision rule in the notes graph).
+    pub fn code_symbol_name_map(&self) -> Result<std::collections::BTreeMap<String, String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name, symbol_id FROM code_symbols ORDER BY symbol_id")?;
+        let mut map = std::collections::BTreeMap::new();
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        for row in rows {
+            let (name, id) = row?;
+            map.entry(name).or_insert(id);
+        }
+        Ok(map)
+    }
+
+    /// Distinct sources owning at least one dangling `uses` edge — the incremental
+    /// `cm map` re-resolution pass walks these (same idea as `dangling_edge_sources`).
+    pub fn dangling_code_sources(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT src FROM code_edges WHERE dst IS NULL AND predicate = 'uses'
+             ORDER BY src",
+        )?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Re-resolve a single dangling `uses` edge's `dst` in place once its target
+    /// name appears (incremental revival). Matches on the verbatim `dst_raw`.
+    pub fn resolve_code_edge(&self, src: &str, dst_raw: &str, dst: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE code_edges SET dst = ?3
+             WHERE src = ?1 AND dst_raw = ?2 AND dst IS NULL AND predicate = 'uses'",
+            params![src, dst_raw, dst],
+        )?;
+        Ok(())
+    }
+
+    /// SQL fragment that drops test-defined symbols unless `include_tests`. Appended
+    /// to a WHERE that already has a condition, so it leads with ` AND`.
+    fn test_clause(include_tests: bool) -> &'static str {
+        if include_tests {
+            ""
+        } else {
+            " AND is_test = 0"
+        }
+    }
+
+    /// Look up symbol definitions by exact name (for `cm map --query <name>`).
+    /// Test-defined symbols are excluded unless `include_tests`.
+    pub fn code_symbols_by_name(
+        &self,
+        name: &str,
+        include_tests: bool,
+    ) -> Result<Vec<CodeSymbolRow>> {
+        let sql = format!(
+            "SELECT symbol_id, path, name, kind, line, signature, is_test FROM code_symbols
+             WHERE name = ?1{} ORDER BY path, line",
+            Self::test_clause(include_tests)
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![name], map_code_symbol)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Symbols defined in a file by EXACT path key, in source order. Used by the
+    /// internal re-map / prune paths, which always hold the canonical stored key —
+    /// they need ALL symbols (tests included), so there's no test filter here.
+    pub fn code_symbols_in(&self, path: &str) -> Result<Vec<CodeSymbolRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT symbol_id, path, name, kind, line, signature, is_test FROM code_symbols
+             WHERE path = ?1 ORDER BY line",
+        )?;
+        let rows = stmt
+            .query_map(params![path], map_code_symbol)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Symbols defined in a file for `cm map --defines <path>`, matched leniently
+    /// so the user needn't know the exact stored key: a path matches when it equals
+    /// the stored key, the stored key ends with `/<path>`, OR `<path>` ends with
+    /// `/storedkey`. That makes `src/code.rs` and `code.rs` interchangeable whether
+    /// the tree was mapped from the repo root or from `./src`. Grouped by path then
+    /// line for stable output. Test symbols excluded unless `include_tests`. The
+    /// `LIKE` escapes are unnecessary here: stored keys are source paths with no
+    /// `%`/`_` metacharacters in practice.
+    pub fn code_symbols_in_like(
+        &self,
+        path: &str,
+        include_tests: bool,
+    ) -> Result<Vec<CodeSymbolRow>> {
+        let key_ends_with_path = format!("%/{path}"); // stored 'a/b/code.rs' vs query 'code.rs'
+        let sql = format!(
+            "SELECT symbol_id, path, name, kind, line, signature, is_test FROM code_symbols
+             WHERE (path = ?1
+                OR path LIKE ?2
+                OR ?1 LIKE '%/' || path){}
+             ORDER BY path, line",
+            Self::test_clause(include_tests)
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![path, key_ends_with_path], map_code_symbol)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Symbol definitions whose name CONTAINS `needle` (case-insensitive), for
+    /// `cm map --like <substr>` — the structural answer to "show me every `code_*`
+    /// function" that exact-name `--query` can't give. `_`/`%` in the needle are
+    /// escaped so they're treated literally (ESCAPE '\'). Test symbols excluded
+    /// unless `include_tests`. Ordered by name for a stable, scannable list.
+    pub fn code_symbols_like(
+        &self,
+        needle: &str,
+        include_tests: bool,
+    ) -> Result<Vec<CodeSymbolRow>> {
+        let escaped = needle
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
+        let sql = format!(
+            "SELECT symbol_id, path, name, kind, line, signature, is_test FROM code_symbols
+             WHERE name LIKE ?1 ESCAPE '\\'{} ORDER BY name, path, line",
+            Self::test_clause(include_tests)
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![pattern], map_code_symbol)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Outgoing calls FROM a symbol — what `name`'s definition(s) depend on, for
+    /// `cm map --calls <name>`. Each row is `(target_name, edge_line, resolved)`:
+    /// `resolved` is true when the call links to an in-project definition (dst set),
+    /// false for external/stdlib names (`map`, `unwrap`, …) that never resolved.
+    /// `resolved_only` drops the unresolved noise — the default, because ~3/4 of
+    /// `uses` edges are stdlib combinators that bury the few real dependencies.
+    /// When several symbols share `name`, edges from all of them are merged.
+    pub fn code_callees_of(
+        &self,
+        name: &str,
+        resolved_only: bool,
+    ) -> Result<Vec<(String, i64, bool)>> {
+        let sql = if resolved_only {
+            "SELECT e.dst_raw, e.line, e.dst IS NOT NULL
+             FROM code_edges e
+             JOIN code_symbols s ON s.symbol_id = e.src
+             WHERE e.predicate = 'uses' AND s.name = ?1 AND e.dst IS NOT NULL
+             ORDER BY e.line, e.dst_raw"
+        } else {
+            "SELECT e.dst_raw, e.line, e.dst IS NOT NULL
+             FROM code_edges e
+             JOIN code_symbols s ON s.symbol_id = e.src
+             WHERE e.predicate = 'uses' AND s.name = ?1
+             ORDER BY e.line, e.dst_raw"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt
+            .query_map(params![name], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, bool>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// All symbol definitions, for `cm map --list` (a table of contents). Optional
+    /// `kind` filter (exact tag kind: function/method/struct→class/…). Test symbols
+    /// excluded unless `include_tests`. Ordered by path then line so a file's
+    /// symbols read top-to-bottom.
+    pub fn code_list(&self, kind: Option<&str>, include_tests: bool) -> Result<Vec<CodeSymbolRow>> {
+        // Build one SQL string; `kind` becomes a WHERE, test-exclusion appends with
+        // the right connective (AND after a kind clause, WHERE on its own).
+        let mut sql = String::from(
+            "SELECT symbol_id, path, name, kind, line, signature, is_test FROM code_symbols",
+        );
+        if kind.is_some() {
+            sql.push_str(" WHERE kind = ?1");
+            if !include_tests {
+                sql.push_str(" AND is_test = 0");
+            }
+        } else if !include_tests {
+            sql.push_str(" WHERE is_test = 0");
+        }
+        sql.push_str(" ORDER BY path, line");
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = match kind {
+            Some(k) => stmt
+                .query_map(params![k], map_code_symbol)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            None => stmt
+                .query_map([], map_code_symbol)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        };
+        Ok(rows)
+    }
+
+    /// Callers of a symbol: the defining symbol rows on the `src` end of every
+    /// resolved `uses` edge whose target is one of `name`'s definitions
+    /// (for `cm map --uses <name>`). Returns each calling symbol with the line.
+    /// Callers defined in test code are excluded unless `include_tests`.
+    pub fn code_callers_of(
+        &self,
+        name: &str,
+        include_tests: bool,
+    ) -> Result<Vec<(CodeSymbolRow, i64)>> {
+        let sql = format!(
+            "SELECT s.symbol_id, s.path, s.name, s.kind, s.line, s.signature, s.is_test, e.line
+             FROM code_edges e
+             JOIN code_symbols t ON t.symbol_id = e.dst
+             JOIN code_symbols s ON s.symbol_id = e.src
+             WHERE e.predicate = 'uses' AND t.name = ?1{}
+             ORDER BY s.path, e.line",
+            if include_tests {
+                ""
+            } else {
+                " AND s.is_test = 0"
+            }
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![name], |r| {
+                Ok((
+                    CodeSymbolRow {
+                        symbol_id: r.get(0)?,
+                        path: r.get(1)?,
+                        name: r.get(2)?,
+                        kind: r.get(3)?,
+                        line: r.get(4)?,
+                        signature: r.get(5)?,
+                        is_test: r.get::<_, i64>(6)? != 0,
+                    },
+                    r.get::<_, i64>(7)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Counts for `cm map` summary output.
+    pub fn code_counts(&self) -> Result<(i64, i64, i64)> {
+        let files = self
+            .conn
+            .query_row("SELECT count(*) FROM code_files", [], |r| r.get(0))?;
+        let symbols = self
+            .conn
+            .query_row("SELECT count(*) FROM code_symbols", [], |r| r.get(0))?;
+        let edges = self
+            .conn
+            .query_row("SELECT count(*) FROM code_edges", [], |r| r.get(0))?;
+        Ok((files, symbols, edges))
+    }
+
     // ---- derived-wipe (reindex --all) ------------------------------------
 
-    /// Wipe the purely-derived tables (notes, notes_fts, sync, imports, edges) for
-    /// a full rebuild. Everything in here can be reconstructed from the files:
-    /// notes/*.md (plus their frontmatter relations and body `[[links]]`) and the
-    /// imports/ originals with their `.meta.json` sidecars. We deliberately leave
-    /// `oplog` (operation history) and `meta` (the embedder signature) alone, since
-    /// those can't be.
+    /// Wipe the purely-derived tables (notes, notes_fts, sync, imports, edges, and
+    /// the code_* graph) for a full rebuild. Everything in here can be reconstructed
+    /// from the files: notes/*.md (plus their frontmatter relations and body
+    /// `[[links]]`), the imports/ originals with their `.meta.json` sidecars, and —
+    /// for the code graph — the source tree on disk. We deliberately leave `oplog`
+    /// (operation history) and `meta` (the embedder signature) alone, since those
+    /// can't be.
     pub fn wipe_derived(&self) -> Result<()> {
         self.conn.execute_batch(
             "DELETE FROM notes_fts; DELETE FROM notes; DELETE FROM sync;
-             DELETE FROM imports; DELETE FROM edges;",
+             DELETE FROM imports; DELETE FROM edges;
+             DELETE FROM code_files; DELETE FROM code_symbols; DELETE FROM code_edges;",
         )?;
         Ok(())
     }
@@ -664,6 +1120,18 @@ fn map_import(r: &rusqlite::Row<'_>) -> rusqlite::Result<ImportRow> {
         chunks: r.get(3)?,
         content_hash: r.get(4)?,
         created_iso: r.get(5)?,
+    })
+}
+
+fn map_code_symbol(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeSymbolRow> {
+    Ok(CodeSymbolRow {
+        symbol_id: r.get(0)?,
+        path: r.get(1)?,
+        name: r.get(2)?,
+        kind: r.get(3)?,
+        line: r.get(4)?,
+        signature: r.get(5)?,
+        is_test: r.get::<_, i64>(6)? != 0,
     })
 }
 
@@ -1251,5 +1719,143 @@ mod tests {
         Store::create(&path).unwrap();
         let s = Store::open(&path).unwrap();
         assert!(s.all().unwrap().is_empty());
+    }
+
+    /// Build a tiny code graph by hand: product defs `parse`/`helper`/`Config` plus
+    /// one TEST symbol `parse_works`, a resolved call and an external one. Exercises
+    /// the Tier-1 query methods and the is_test filter.
+    fn seed_code_graph(s: &Store) {
+        s.upsert_code_file("a.rs", "rust", "h1", 0).unwrap();
+        // last arg = is_test
+        s.insert_code_symbol(
+            "sp",
+            "a.rs",
+            "parse",
+            "function",
+            1,
+            Some("fn parse()"),
+            false,
+        )
+        .unwrap();
+        s.insert_code_symbol(
+            "sh",
+            "a.rs",
+            "helper",
+            "function",
+            5,
+            Some("fn helper()"),
+            false,
+        )
+        .unwrap();
+        s.insert_code_symbol(
+            "sc",
+            "a.rs",
+            "Config",
+            "class",
+            9,
+            Some("struct Config"),
+            false,
+        )
+        .unwrap();
+        s.insert_code_symbol(
+            "st",
+            "a.rs",
+            "parse_works",
+            "method",
+            20,
+            Some("fn parse_works()"),
+            true,
+        )
+        .unwrap();
+        // defines edges
+        s.insert_code_edge("a.rs", "defines", Some("sp"), "parse", 1)
+            .unwrap();
+        s.insert_code_edge("a.rs", "defines", Some("sh"), "helper", 5)
+            .unwrap();
+        // parse uses helper (resolved) and collect (external/unresolved)
+        s.insert_code_edge("sp", "uses", Some("sh"), "helper", 2)
+            .unwrap();
+        s.insert_code_edge("sp", "uses", None, "collect", 2)
+            .unwrap();
+    }
+
+    #[test]
+    fn code_symbols_like_matches_substring_case_insensitively() {
+        let s = mem();
+        seed_code_graph(&s);
+        let names: Vec<String> = s
+            .code_symbols_like("ELP", false)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(names, vec!["helper"]); // 'helper' contains 'elp', case-insensitive
+                                           // a needle matching nothing is empty, and `%`/`_` are literal (escaped).
+        assert!(s.code_symbols_like("%", false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn code_callees_of_filters_unresolved_by_default() {
+        let s = mem();
+        seed_code_graph(&s);
+        // Default: resolved-only -> just the in-project `helper`, not `collect`.
+        let resolved: Vec<String> = s
+            .code_callees_of("parse", true)
+            .unwrap()
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect();
+        assert_eq!(resolved, vec!["helper"]);
+        // With unresolved included, the external `collect` shows up too.
+        let all: Vec<(String, bool)> = s
+            .code_callees_of("parse", false)
+            .unwrap()
+            .into_iter()
+            .map(|(name, _, ok)| (name, ok))
+            .collect();
+        assert!(all.contains(&("helper".to_string(), true)));
+        assert!(all.contains(&("collect".to_string(), false)));
+    }
+
+    #[test]
+    fn code_list_optionally_filters_by_kind() {
+        let s = mem();
+        seed_code_graph(&s);
+        // Default hides the test symbol -> 3 product defs.
+        let all = s.code_list(None, false).unwrap();
+        assert_eq!(all.len(), 3); // parse, helper, Config
+        let classes: Vec<String> = s
+            .code_list(Some("class"), false)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(classes, vec!["Config"]); // only the struct/class kind
+    }
+
+    #[test]
+    fn code_queries_hide_test_symbols_unless_included() {
+        let s = mem();
+        seed_code_graph(&s);
+        // --list default: the test symbol parse_works is hidden.
+        assert!(s
+            .code_list(None, false)
+            .unwrap()
+            .iter()
+            .all(|r| r.name != "parse_works"));
+        // include_tests=true brings it back (4 symbols total).
+        assert_eq!(s.code_list(None, true).unwrap().len(), 4);
+        // --like default hides it; with tests it appears.
+        assert!(s.code_symbols_like("parse", false).unwrap().len() == 1); // just `parse`
+        assert_eq!(s.code_symbols_like("parse", true).unwrap().len(), 2); // + parse_works
+                                                                          // --query by exact name respects the filter too.
+        assert!(s
+            .code_symbols_by_name("parse_works", false)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            s.code_symbols_by_name("parse_works", true).unwrap().len(),
+            1
+        );
     }
 }
