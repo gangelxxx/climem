@@ -12,6 +12,7 @@ use crate::output::print_line;
 use crate::store::Store;
 use crate::util::{AppError, Result};
 use serde_json::json;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 pub fn run(p: &Parsed) -> Result<()> {
@@ -463,8 +464,23 @@ fn map_source_tree(target: &Path, folder: &Path, store_path: &Path) -> Option<Ma
             return None;
         }
     };
-    match commands::map_tree(&store, target, folder, None, None) {
+    // Show a live progress bar while the tree is parsed (it can be hundreds of
+    // files). Only when stderr is a real terminal — a redirected/piped stderr (CI,
+    // logs) would otherwise fill with `\r`-spam, so there we stay silent and let the
+    // step's final summary line speak. The bar is the only `progress` here; passing
+    // `None` would index just as correctly but appear hung.
+    let bar: Option<Box<dyn Fn(usize, usize)>> = if std::io::stderr().is_terminal() {
+        Some(Box::new(progress_bar))
+    } else {
+        None
+    };
+    let progress = bar.as_deref();
+    match commands::map_tree(&store, target, folder, None, None, progress) {
         Ok(stats) => {
+            // Erase the bar's line so the summary that follows starts clean.
+            if progress.is_some() {
+                clear_progress_line();
+            }
             let _ = store.log_op("map", Some(&target.to_string_lossy()));
             let (files, symbols, edges) = store.code_counts().unwrap_or((0, 0, 0));
             let langs = commands::lang_breakdown(&stats.by_lang);
@@ -479,6 +495,10 @@ fn map_source_tree(target: &Path, folder: &Path, store_path: &Path) -> Option<Ma
             })
         }
         Err(e) => {
+            // Erase any partial bar line before the error so it reads cleanly.
+            if progress.is_some() {
+                clear_progress_line();
+            }
             // The headline case: binary built without the `code` feature. Surface
             // the rebuild hint, but keep the freshly-scaffolded store intact.
             eprintln!("      skipping: code indexing unavailable: {}", e.msg);
@@ -488,6 +508,57 @@ fn map_source_tree(target: &Path, folder: &Path, store_path: &Path) -> Option<Ma
             None
         }
     }
+}
+
+/// Width of the ASCII progress bar's fill area (characters between the brackets).
+const PROGRESS_BAR_WIDTH: usize = 18;
+
+/// Build the progress-bar text for `done`/`total`: `      [######------------]  47%  142/300`.
+/// Pure (no I/O) so the layout is unit-testable. `filled` is the floor of the ratio
+/// so the bar only shows full at completion; `pct` likewise floors (49/100 reads as
+/// 49%, never a premature 50). Returns the empty string for `total == 0` (no source
+/// files) — the caller then draws nothing. No leading `\r` / trailing escape: those
+/// are the I/O concern of `progress_bar`.
+fn render_bar(done: usize, total: usize) -> String {
+    if total == 0 {
+        return String::new();
+    }
+    // Clamp so a `done > total` slip can't overflow the fill or exceed 100%.
+    let done = done.min(total);
+    let filled = done * PROGRESS_BAR_WIDTH / total;
+    let pct = done * 100 / total;
+    let bar: String = std::iter::repeat_n('#', filled)
+        .chain(std::iter::repeat_n('-', PROGRESS_BAR_WIDTH - filled))
+        .collect();
+    format!("      [{bar}] {pct:>3}%  {done}/{total}")
+}
+
+/// Draw the in-place indexing progress bar to stderr: `[######------] 47% 142/300`,
+/// rewritten on the same line via a leading `\r`. Called once per file by
+/// `map_tree`; only wired in when stderr is a terminal (so non-TTY runs never see
+/// `\r`-spam — `map_source_tree` decides that). Keeps data/JSONL on stdout untouched
+/// (conventions.md: narration is stderr-only).
+fn progress_bar(done: usize, total: usize) {
+    use std::io::Write;
+    let line = render_bar(done, total);
+    if line.is_empty() {
+        return;
+    }
+    // `\r` returns to column 0; no trailing newline, so the next call overwrites.
+    // `\x1b[K` clears any leftover from a previously longer line.
+    let mut err = std::io::stderr();
+    let _ = write!(err, "\r{line}\x1b[K");
+    let _ = err.flush();
+}
+
+/// Erase the progress bar's line (return to column 0 and clear to end-of-line) so
+/// whatever prints next — the summary or an error — starts on a clean line. Paired
+/// with `progress_bar`; only called when the bar was actually drawn.
+fn clear_progress_line() {
+    use std::io::Write;
+    let mut err = std::io::stderr();
+    let _ = write!(err, "\r\x1b[K");
+    let _ = err.flush();
 }
 
 /// Pull the project's docs into the store. Two modes:
@@ -1256,6 +1327,34 @@ mod tests {
         for no in ["", "n", "no", "нет", "x", "yep", "\u{feff}n", "ладно"] {
             assert!(!is_yes(no), "{no:?} should not be yes");
         }
+    }
+
+    #[test]
+    fn render_bar_layout_endpoints_and_midpoint() {
+        // Empty store / no source files: nothing to draw.
+        assert_eq!(render_bar(0, 0), "");
+        // Start: zero fill, 0%, count shown.
+        assert_eq!(
+            render_bar(0, 300),
+            "      [------------------]   0%  0/300"
+        );
+        // Completion: full fill, 100%.
+        assert_eq!(
+            render_bar(300, 300),
+            "      [##################] 100%  300/300"
+        );
+        // Roughly half (142/300 = 47%): floored fill and percent.
+        let mid = render_bar(142, 300);
+        assert!(mid.contains(" 47%  142/300"), "{mid:?}");
+        // 18-wide fill: 142/300*18 = 8 hashes.
+        assert!(mid.contains("[########----------]"), "{mid:?}");
+    }
+
+    #[test]
+    fn render_bar_clamps_overrun() {
+        // A done>total slip must not overflow the fill or exceed 100%.
+        assert_eq!(render_bar(5, 3), render_bar(3, 3));
+        assert!(render_bar(5, 3).contains("100%"));
     }
 
     /// A path that can't exist inside the test dir, so nothing is excluded.

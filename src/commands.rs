@@ -874,7 +874,14 @@ pub fn map(p: &Parsed, ctx: &Ctx) -> Result<()> {
         .map(Path::to_path_buf)
         .unwrap_or_default();
 
-    let stats = map_tree(&store, root, &mem_dir, p.value("lang"), p.value("exclude"))?;
+    let stats = map_tree(
+        &store,
+        root,
+        &mem_dir,
+        p.value("lang"),
+        p.value("exclude"),
+        None,
+    )?;
     store.log_op("map", Some(&root.to_string_lossy()))?;
 
     let (n_files, n_symbols, n_edges) = store.code_counts()?;
@@ -911,23 +918,35 @@ pub(crate) struct MapStats {
 /// resolve `uses` edges by name. Shared by `cm map` and `cm init --code`. Does NOT
 /// log the op or print — callers decide that. Propagates the no-`code`-feature
 /// rebuild hint so the caller can surface (map) or downgrade (init) it.
+///
+/// `progress`, if given, is called once per walked file as `(done, total)` BEFORE
+/// that file is parsed (so it reaches `total/total` exactly), letting a caller draw
+/// a live progress indicator. It's only a display hook — parsing is the same with or
+/// without it. `cm map` passes `None`; `init` passes a bar-drawer.
 pub(crate) fn map_tree(
     store: &Store,
     root: &Path,
     mem_dir: &Path,
     lang_filter: Option<&str>,
     exclude: Option<&str>,
+    progress: Option<&dyn Fn(usize, usize)>,
 ) -> Result<MapStats> {
     let mut files: Vec<PathBuf> = Vec::new();
     collect_source_files(root, mem_dir, exclude, &mut files);
     files.sort();
 
+    let total = files.len();
     let mut scanned = 0usize;
     let mut changed = 0usize;
     let mut no_grammar = 0usize;
     let mut unparsed = 0usize;
     let mut by_lang: std::collections::BTreeMap<&'static str, usize> = Default::default();
-    for path in &files {
+    for (i, path) in files.iter().enumerate() {
+        // Report progress per walked file (1-based) before doing its work, so a
+        // long parse pass visibly advances rather than appearing hung.
+        if let Some(cb) = progress {
+            cb(i + 1, total);
+        }
         let lang = match crate::code::lang_for_path(path) {
             Some(l) => l,
             None => {
