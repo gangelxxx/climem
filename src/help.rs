@@ -81,8 +81,21 @@ COMMANDS (full reference)
     (<name>/.init-manifest.json) recording what it changed — the root .gitignore it
     touched, an AGENTS.md it created, and each imported doc's original path — so
     `deinit` can roll the project back exactly.
-    If the data folder already exists it is LEFT ALONE and you get
-      {"status":"already_exists"}.
+    IDEMPOTENT. init brings the project to a fully-initialized state and touches only
+    what is MISSING. A partial layout (e.g. an empty `memory/`, or one whose derived
+    store.db was deleted) is COMPLETED in place — each piece is created only if absent,
+    so a good store.db and a user-edited config.json are never overwritten ({"status":
+    "repaired"}). If store.db was missing and the md truth (notes/ + imports/) is still
+    there, init also REBUILDS the document index from it automatically, so `recall` works
+    right away without a manual `cm reindex`. A FRESH layout gives {"status":"created"} — and since `deinit` leaves
+    config.json behind, re-running init after a deinit is a fresh "created", not a
+    repair. Only when EVERYTHING is already present and current is it a true no-op:
+    {"status":"already_exists"} (pass --docs <paths> to import more, delete the folder to
+    start over, or `cm reindex` to rebuild just the index). An EXPLICIT --docs is honored
+    even on a complete layout — it imports those paths into the existing store instead of
+    short-circuiting. An existing config.json is always kept verbatim — re-running with
+    --model/--provider/etc. on top of one leaves it unchanged (those flags only apply to
+    a fresh config).
     DOCS. By default init auto-scans the target for .md files and, if it finds any,
     lists the folders they live in and asks ONE y/N before importing the lot. The
     project's ROOT entry-point files (README.md and the agent-instruction docs

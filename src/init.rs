@@ -33,77 +33,145 @@ pub fn run(p: &Parsed) -> Result<()> {
     // root finds its data without a --dir flag.
     let name = p.value("name").unwrap_or("memory");
     let data_folder = target.join(name);
+    let config_path = target.join("config.json");
 
-    // Never clobber an existing store (desc.md §5); just say so and stop. Key off the
-    // data folder (where store.db lives) — that's the thing we'd overwrite.
-    if data_folder.exists() {
+    // `init` is idempotent: it brings the project up to a fully-initialized state and
+    // touches only what is missing or stale (desc.md §5: never clobber an existing
+    // store). Probe what's already on disk so the rest of `run` can re-create just the
+    // gaps. A FULLY-complete layout short-circuits below; a partial one is repaired.
+    let pre = LayoutState::probe(target, &data_folder, &config_path);
+
+    // The config is the one place where re-running could destroy user edits (secrets'
+    // env-var names, tuned weights). If a config.json already exists, ADOPT it verbatim
+    // — never overwrite — and warn that the embedding flags don't retro-apply. Only a
+    // fresh init builds a config from defaults + flags.
+    let cfg = if pre.config {
+        if ["model", "provider", "endpoint", "dimension"]
+            .iter()
+            .any(|f| p.value(f).is_some())
+        {
+            eprintln!(
+                "      note: config.json already exists — keeping it; --model/--provider/--endpoint/--dimension ignored"
+            );
+        }
+        // A broken config.json is fatal here: we won't silently replace what might be a
+        // user's tuned file, and proceeding with defaults would mask the corruption.
+        Config::load(&config_path)?
+    } else {
+        // Start from the defaults, then layer on any flag overrides. `data_dir = <name>`
+        // is what points the root config at the data subfolder.
+        let mut cfg = Config::new_named(name);
+        cfg.data_dir = name.to_string();
+        if let Some(m) = p.value("model") {
+            cfg.embedding.model = m.to_string();
+        }
+        if let Some(pr) = p.value("provider") {
+            cfg.embedding.provider = pr.to_string();
+        }
+        if let Some(ep) = p.value("endpoint") {
+            cfg.embedding.endpoint = Some(ep.to_string());
+        }
+        if let Some(dim) = p.value("dimension") {
+            cfg.embedding.dimension = dim
+                .parse()
+                .map_err(|_| AppError::new(format!("--dimension must be a number, got '{dim}'")))?;
+        }
+        cfg
+    };
+
+    // Fully-initialized already → nothing to do. This is the new, smarter guard: not
+    // "the data folder exists" (which an empty/partial folder also satisfies), but
+    // "every artifact init produces is present and current". A partial layout falls
+    // through to the repair path below. The exe-display is needed to judge whether the
+    // wired pointer is current, so compute it the same way the wiring step will.
+    let exe_name = if cfg!(windows) { "cm.exe" } else { "cm" };
+    let exe_dest = target.join(exe_name);
+    let exe_display = exe_command_display(target, &exe_dest);
+    // An explicit `--docs <paths>` is a request to import THOSE docs now, even into an
+    // otherwise-complete store. Don't short-circuit then — fall through so the import
+    // step runs (it's idempotent enough; the user named the paths deliberately). The
+    // empty-value filter mirrors the import step, so `--docs ""`/`--docs ,` (i.e. "not
+    // really given") still allow the no-op short-circuit.
+    let explicit_docs = p.value("docs").is_some_and(docs_arg_has_entry);
+    if !explicit_docs && pre.is_complete(target, &exe_display) {
         println!(
             "{}",
             json!({
                 "status": "already_exists",
                 "path": data_folder.to_string_lossy(),
-                "note": "Store already exists — nothing touched. Delete/rename the folder to re-init.",
+                "note": "Fully initialized — nothing to do. Pass --docs <paths> to import more, delete the folder to start over, or `cm reindex` to rebuild the index.",
             })
         );
         return Ok(());
-    }
-
-    // Start from the defaults, then layer on any flag overrides. `data_dir = <name>`
-    // is what points the root config at the data subfolder.
-    let mut cfg = Config::new_named(name);
-    cfg.data_dir = name.to_string();
-    if let Some(m) = p.value("model") {
-        cfg.embedding.model = m.to_string();
-    }
-    if let Some(pr) = p.value("provider") {
-        cfg.embedding.provider = pr.to_string();
-    }
-    if let Some(ep) = p.value("endpoint") {
-        cfg.embedding.endpoint = Some(ep.to_string());
-    }
-    if let Some(dim) = p.value("dimension") {
-        cfg.embedding.dimension = dim
-            .parse()
-            .map_err(|_| AppError::new(format!("--dimension must be a number, got '{dim}'")))?;
     }
 
     // Narrate the run as numbered steps on stderr (data/JSONL stays on stdout). The
     // user dropped a binary and ran `cm init`; show them what each phase did.
     let do_code = !p.has("no-code");
     let total_steps = if do_code { 4 } else { 3 };
+    let store_path = data_folder.join("store.db");
+    // `repairing` distinguishes a fresh init from filling gaps in a partial layout, so
+    // the narration and final status read truthfully ("repaired" vs "created").
+    let repairing = pre.any_present();
     eprintln!(
-        "cm init → {} (data in {}/)",
+        "cm init → {} (data in {}/){}",
         target.to_string_lossy(),
-        name
+        name,
+        if repairing {
+            " — completing existing layout"
+        } else {
+            ""
+        }
     );
 
-    // [1/N] Scaffold. config.json goes at the ROOT (next to the binary); the data
-    // dirs go under `data_folder`. notes/ and imports/ are the source of truth; the
-    // store.db is the derived, rebuildable index.
+    // [1/N] Scaffold — create only what's MISSING (idempotent). config.json goes at the
+    // ROOT (next to the binary); the data dirs go under `data_folder`. notes/ and
+    // imports/ are the source of truth; store.db is the derived, rebuildable index.
+    // Each piece is guarded by `pre` so a re-run never overwrites a good store.db or a
+    // user-edited config.json — it only fills the holes.
     step(1, total_steps, "Creating memory folder");
     std::fs::create_dir_all(data_folder.join("notes"))?;
     std::fs::create_dir_all(data_folder.join("imports"))?;
     std::fs::create_dir_all(data_folder.join("models"))?;
-    let config_path = target.join("config.json");
-    cfg.save(&config_path)?;
+    if !pre.config {
+        cfg.save(&config_path)?;
+    }
 
-    let store_path = data_folder.join("store.db");
-    Store::create(&store_path)?;
+    // `Store::create` is itself idempotent (CREATE TABLE IF NOT EXISTS), but skip it
+    // when the store already exists so we never touch a good index's mtime.
+    if !pre.store {
+        Store::create(&store_path)?;
+    }
+
+    // REPAIR a lost index: if we just (re)created store.db but the md TRUTH is still on
+    // disk (notes/ or imports/ non-empty), rebuild the document index from it. Without
+    // this, a repair after `store.db` was deleted would leave `recall` empty until the
+    // user manually ran `cm reindex` — the store is derived, so init should restore it
+    // automatically. We only do this on a genuine repair (store was missing AND truth
+    // exists); a fresh init has nothing to rebuild, and a present store is left alone.
+    // Best-effort: a failure here never aborts the scaffold (the store is still valid,
+    // just empty, and `cm reindex` remains the fallback). Code indexing is handled
+    // separately in step [4/N]; this is documents only.
+    if !pre.store && has_md_truth(&data_folder) {
+        reindex_documents(target, &data_folder);
+    }
 
     // A .gitignore INSIDE the data folder: commit the TRUTH (notes/ + imports/) but
-    // ignore the derived index and re-downloadable weights.
-    let gitignore = "# Derived index — rebuild from md with `cm reindex`.\n\
-                     store.db\nstore.db-wal\nstore.db-shm\n\
-                     # Embedding weights (re-downloadable).\nmodels/\n";
-    let _ = std::fs::write(data_folder.join(".gitignore"), gitignore);
+    // ignore the derived index and re-downloadable weights. Write it only if absent so
+    // a user's tweaks to it survive a repair run.
+    if !pre.data_gitignore {
+        let gitignore = "# Derived index — rebuild from md with `cm reindex`.\n\
+                         store.db\nstore.db-wal\nstore.db-shm\n\
+                         # Embedding weights (re-downloadable).\nmodels/\n";
+        let _ = std::fs::write(data_folder.join(".gitignore"), gitignore);
+    }
 
     // Make sure a copy of the binary sits at the ROOT (so `cm` is findable next to
     // its config). Usually it's already there — the user dropped it — but when init
     // runs via `cargo run`/elsewhere, copy it in. Skip if the running exe already IS
     // the root copy (compare canonicalized paths so a relative target like `.` still
-    // matches the absolute current_exe()).
-    let exe_name = if cfg!(windows) { "cm.exe" } else { "cm" };
-    let exe_dest = target.join(exe_name);
+    // matches the absolute current_exe()). `exe_dest`/`exe_display` were computed up
+    // top (the completeness check needed them); reuse them here.
     let self_exe = std::env::current_exe()?;
     if !same_file(&self_exe, &exe_dest) {
         if let Err(e) = std::fs::copy(&self_exe, &exe_dest) {
@@ -111,11 +179,6 @@ pub fn run(p: &Parsed) -> Result<()> {
             eprintln!("warning: could not copy the binary to the project root: {e}");
         }
     }
-
-    // How the binary is spelled as a command in every wired pointer + the guide:
-    // short, relative-to-root, runnable (`.\cm.exe`). Computed once and threaded
-    // through so all generated text uses the same tidy path, not a long absolute one.
-    let exe_display = exe_command_display(target, &exe_dest);
 
     // The binary now lives at the project ROOT, which has no .gitignore coverage of
     // our doing. It's large (tens of MB) and rebuildable, so make sure git won't
@@ -191,6 +254,9 @@ pub fn run(p: &Parsed) -> Result<()> {
     };
 
     let mut out = json!({
+        // "repaired" when we filled gaps in a partial layout, "created" for a fresh
+        // one — so a caller can tell a first init from a top-up.
+        "status": if repairing { "repaired" } else { "created" },
         "created": data_folder.to_string_lossy(),
         "exe": exe_dest.to_string_lossy(),
         "store": store_path.to_string_lossy(),
@@ -213,13 +279,36 @@ pub fn run(p: &Parsed) -> Result<()> {
     // came from where, how the root .gitignore was touched, whether AGENTS.md was
     // created) so `deinit` can undo init precisely. It's internal data, so it goes to
     // disk only — never to stdout.
-    let manifest = InitManifest {
-        version: 1,
-        data_dir: name.to_string(),
-        root_gitignore: gi_state,
-        created_agents_md,
-        created_cm_guide,
-        docs: doc_stats.records,
+    //
+    // On a REPAIR (a manifest already exists from the first init) we MERGE rather than
+    // overwrite, so the original rollback truth survives. The pre-init `.gitignore`
+    // snapshot and the "init created this file" flags are authoritative from the FIRST
+    // run — a repair re-deriving them would be wrong (e.g. it now sees the .gitignore
+    // it itself created and would conclude "leave it"). We keep those, OR-in anything
+    // this run additionally created, and extend the doc records with newly-imported docs.
+    let manifest = match read_manifest_opt(&data_folder) {
+        Some(mut prev) => {
+            prev.version = 1;
+            prev.data_dir = name.to_string();
+            prev.created_agents_md |= created_agents_md;
+            prev.created_cm_guide |= created_cm_guide;
+            // Only adopt this run's gitignore state if the first run recorded none
+            // (e.g. an older manifest predating the field, or a repair after a manual
+            // gitignore deletion that this run re-created).
+            if !prev.root_gitignore.modified && gi_state.modified {
+                prev.root_gitignore = gi_state;
+            }
+            prev.docs.extend(doc_stats.records);
+            prev
+        }
+        None => InitManifest {
+            version: 1,
+            data_dir: name.to_string(),
+            root_gitignore: gi_state,
+            created_agents_md,
+            created_cm_guide,
+            docs: doc_stats.records,
+        },
     };
     write_manifest(&data_folder, &manifest);
 
@@ -244,6 +333,109 @@ fn write_manifest(data_folder: &Path, manifest: &InitManifest) {
         }
         Err(e) => eprintln!("      rollback manifest could not be serialized: {e}"),
     }
+}
+
+/// Read the rollback manifest from a data folder if it exists and parses, else `None`.
+/// Used by a repair run to MERGE into the first init's manifest instead of clobbering
+/// its rollback truth (see `run`). A missing or garbled manifest is treated as "none" —
+/// the repair then writes a fresh one, the same as a first init would.
+fn read_manifest_opt(data_folder: &Path) -> Option<InitManifest> {
+    let text = std::fs::read_to_string(data_folder.join(MANIFEST_NAME)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// A snapshot of which init artifacts already exist on disk, taken BEFORE init touches
+/// anything. It drives the idempotent repair path: each scaffold piece is created only
+/// when its flag is false, and `is_complete` decides whether there's anything to do at
+/// all. Probing is pure filesystem reads — no mutation — so it's safe to call up front.
+struct LayoutState {
+    /// `config.json` at the project root.
+    config: bool,
+    /// `store.db` in the data folder.
+    store: bool,
+    /// All three data subdirs (`notes/`, `imports/`, `models/`) present.
+    dirs: bool,
+    /// The data folder's own `.gitignore` (ignores the derived index + weights).
+    data_gitignore: bool,
+    /// The cm binary sits at the project root.
+    exe: bool,
+    /// The root `.gitignore` already ignores the binary (our marker, or the user's
+    /// own `cm.exe` rule) — i.e. `ensure_binary_ignored` would be a no-op.
+    root_ignored: bool,
+    /// `CM_GUIDE.md` at the root.
+    guide: bool,
+}
+
+impl LayoutState {
+    /// Read the current on-disk state of every init artifact. Pure (filesystem reads
+    /// only); call it once before the scaffold so the repair path knows the gaps.
+    fn probe(target: &Path, data_folder: &Path, config_path: &Path) -> LayoutState {
+        let exe_name = if cfg!(windows) { "cm.exe" } else { "cm" };
+        let root_gi = std::fs::read_to_string(target.join(".gitignore")).unwrap_or_default();
+        LayoutState {
+            config: config_path.is_file(),
+            store: data_folder.join("store.db").is_file(),
+            dirs: data_folder.join("notes").is_dir()
+                && data_folder.join("imports").is_dir()
+                && data_folder.join("models").is_dir(),
+            data_gitignore: data_folder.join(".gitignore").is_file(),
+            exe: target.join(exe_name).is_file(),
+            root_ignored: root_gi.contains(GITIGNORE_MARKER)
+                || root_gi.lines().any(|l| l.trim() == "cm.exe"),
+            guide: target.join(CM_GUIDE_NAME).is_file(),
+        }
+    }
+
+    /// True if a PRIOR init left MEMORY DATA behind — i.e. this run is completing a
+    /// partial layout, not a fresh one. Used only to phrase the narration ("completing
+    /// existing layout") and the final status ("repaired" vs "created").
+    ///
+    /// Deliberately ignores `exe`, `root_ignored`, AND `config`. The usual fresh flow
+    /// is "drop the binary, then `cm init`", so the binary (and a user's pre-existing
+    /// root `.gitignore` rule) being present isn't a prior init. And `deinit`
+    /// intentionally LEAVES `config.json` at the root, so a lone config is the
+    /// after-state of a full uninstall — re-`init`-ing onto it is a FRESH setup
+    /// ("created"), not a repair (the config is still adopted, never overwritten; it
+    /// just doesn't, by itself, mark the run as a repair). Only the data-folder
+    /// artifacts init authors — store / dirs / data-.gitignore / guide — count as
+    /// "memory data already here".
+    fn any_present(&self) -> bool {
+        self.store || self.dirs || self.data_gitignore || self.guide
+    }
+
+    /// True when there is nothing left for init to do: the full scaffold is present,
+    /// the binary is placed and git-ignored, the guide is written, and at least one
+    /// agent instruction file carries a CURRENT pointer block. We check the wired
+    /// pointer last (it's the only part needing a file read against `exe_display`) so a
+    /// stale pointer (re-init under a new path) correctly reports "incomplete" and gets
+    /// refreshed. When this is true, `run` prints `already_exists` and stops.
+    fn is_complete(&self, target: &Path, exe_display: &str) -> bool {
+        self.config
+            && self.store
+            && self.dirs
+            && self.data_gitignore
+            && self.exe
+            && self.root_ignored
+            && self.guide
+            && instruction_pointer_current(target, exe_display)
+    }
+}
+
+/// True if some agent instruction file under `target` already carries the CURRENT cm
+/// pointer block (byte-identical to what wiring would write for `exe_display`). This is
+/// the last gate of `LayoutState::is_complete`: it ensures a re-init under a new exe
+/// path (stale pointer) is treated as incomplete and re-wired, not skipped. Mirrors the
+/// matching `wire_entry_points` does, but read-only.
+fn instruction_pointer_current(target: &Path, exe_display: &str) -> bool {
+    let block = entry_point_block(exe_display);
+    ENTRY_POINT_NAMES.iter().any(|rel| {
+        let path = rel
+            .split('/')
+            .fold(target.to_path_buf(), |p, seg| p.join(seg));
+        std::fs::read_to_string(&path)
+            .map(|text| text.contains(&block))
+            .unwrap_or(false)
+    })
 }
 
 /// Emit one numbered step header to stderr: `[2/4] Collecting documentation`.
@@ -510,6 +702,44 @@ fn map_source_tree(target: &Path, folder: &Path, store_path: &Path) -> Option<Ma
     }
 }
 
+/// True if the data folder still holds md SOURCE OF TRUTH — at least one `.md` under
+/// `notes/` or `imports/`. Used by the repair path to decide whether a freshly
+/// (re)created store.db has documents to rebuild from. A fresh init (empty folders)
+/// returns false, so we don't run a pointless reindex.
+fn has_md_truth(data_folder: &Path) -> bool {
+    let has_md_in = |dir: PathBuf| -> bool {
+        std::fs::read_dir(dir).ok().is_some_and(|rd| {
+            rd.filter_map(|e| e.ok())
+                .any(|e| e.file_type().is_ok_and(|t| t.is_file()) && is_md(&e.path()))
+        })
+    };
+    has_md_in(data_folder.join("notes")) || has_md_in(data_folder.join("imports"))
+}
+
+/// Rebuild the DOCUMENT index (notes/ + imports/) from the md truth after init had to
+/// (re)create an empty store.db — so `recall` works immediately on a repair instead of
+/// silently returning nothing until the user runs `cm reindex` by hand. Reuses the very
+/// same `commands::reindex` the `cm reindex` command runs, via a `Ctx` rooted at the
+/// project target (it reads `config.json` there to resolve the data dir). Best-effort:
+/// any error is a non-fatal stderr warning — the store is valid (just empty), and
+/// `cm reindex` stays the manual fallback. This handles DOCUMENTS only; the code graph
+/// is (re)built separately in step [4/N].
+fn reindex_documents(target: &Path, data_folder: &Path) {
+    eprintln!("      store.db was missing — rebuilding the document index from md…");
+    // An empty Parsed → no `--all`, so reindex runs incrementally (full rebuild here
+    // anyway, since the store is empty and every md file reads as new).
+    let empty = Parsed::parse(&[]);
+    let ctx = commands::Ctx::new(target);
+    match commands::reindex(&empty, &ctx) {
+        Ok(()) => {} // reindex already printed its own {"indexed","changed"} JSON line
+        Err(e) => eprintln!(
+            "      could not rebuild the document index ({}); run `cm reindex` to fix. [{}]",
+            e.msg,
+            data_folder.to_string_lossy()
+        ),
+    }
+}
+
 /// Width of the ASCII progress bar's fill area (characters between the brackets).
 const PROGRESS_BAR_WIDTH: usize = 18;
 
@@ -607,8 +837,7 @@ fn import_existing_md(
             for (dir, count) in doc_folder_summary(target, &found) {
                 eprintln!("        {dir}  ({count} .md)");
             }
-            if !prompt_yes_no("      Import from these folders? [y/N]: ")
-            {
+            if !prompt_yes_no("      Import from these folders? [y/N]: ") {
                 eprintln!("      import declined");
                 return stats;
             }
@@ -657,11 +886,7 @@ fn import_existing_md(
                 }));
             }
             Err(e) => {
-                eprintln!(
-                    "      could not import {}: {}",
-                    path.display(),
-                    e.msg
-                );
+                eprintln!("      could not import {}: {}", path.display(), e.msg);
             }
         }
     }
@@ -1334,10 +1559,7 @@ mod tests {
         // Empty store / no source files: nothing to draw.
         assert_eq!(render_bar(0, 0), "");
         // Start: zero fill, 0%, count shown.
-        assert_eq!(
-            render_bar(0, 300),
-            "      [------------------]   0%  0/300"
-        );
+        assert_eq!(render_bar(0, 300), "      [------------------]   0%  0/300");
         // Completion: full fill, 100%.
         assert_eq!(
             render_bar(300, 300),
@@ -1763,16 +1985,211 @@ mod tests {
     }
 
     #[test]
-    fn init_idempotent_on_existing_folder() {
+    fn init_repairs_partial_layout_keeping_user_files() {
+        // A pre-existing but EMPTY data folder is no longer "already initialized": it's
+        // partial, so init completes it (scaffolds the store + dirs) WITHOUT clobbering
+        // anything the user put there. This replaces the old "empty folder → no-op".
         let tmp = TempDir::new().unwrap();
         let folder = tmp.path().join("m");
         std::fs::create_dir_all(&folder).unwrap();
         let sentinel = folder.join("sentinel.txt");
         std::fs::write(&sentinel, "keep").unwrap();
-        let (res, _) = run_init(&tmp, &["--name", "m"]);
+        let (res, _) = run_init(&tmp, &["--name", "m", "--no-code"]);
         res.unwrap();
-        assert!(sentinel.exists()); // untouched
-        assert!(!folder.join("store.db").exists()); // nothing scaffolded
+        assert!(sentinel.exists()); // user file untouched
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "keep");
+        // ...and the missing pieces were filled in.
+        assert!(folder.join("store.db").exists());
+        assert!(folder.join("notes").is_dir());
+        assert!(tmp.path().join("config.json").exists());
+    }
+
+    #[test]
+    fn init_completes_when_only_store_missing() {
+        // Run init once to get a full layout, delete just the derived store.db, and
+        // re-init: the store is re-created, the user-edited config.json is KEPT verbatim.
+        let tmp = TempDir::new().unwrap();
+        let (res, folder) = run_init(&tmp, &["--name", "m", "--no-code"]);
+        res.unwrap();
+        // Mutate the config so we can prove a repair adopts it rather than overwriting.
+        let config_path = tmp.path().join("config.json");
+        let mut cfg = Config::load(&config_path).unwrap();
+        cfg.embedding.model = "user-tuned-model".to_string();
+        cfg.save(&config_path).unwrap();
+        std::fs::remove_file(folder.join("store.db")).unwrap();
+
+        let (res2, _) = run_init(&tmp, &["--name", "m", "--no-code"]);
+        res2.unwrap();
+        assert!(folder.join("store.db").exists()); // re-created
+                                                   // The user's edited config survived the repair (not reset to defaults).
+        assert_eq!(
+            Config::load(&config_path).unwrap().embedding.model,
+            "user-tuned-model"
+        );
+    }
+
+    #[test]
+    fn init_rebuilds_document_index_after_store_loss() {
+        // The defect a live test on a real project caught: deleting the derived store.db
+        // and re-running init re-created an EMPTY store and re-indexed only code, leaving
+        // `recall` blank until a manual `cm reindex`. The repair must rebuild the doc
+        // index from the md truth in imports/ automatically.
+        let tmp = TempDir::new().unwrap();
+        // Install with one doc so imports/ holds md truth.
+        let docs = tmp.path().join("d");
+        std::fs::create_dir(&docs).unwrap();
+        std::fs::write(docs.join("spec.md"), "# Spec\nbody about widgets").unwrap();
+        let docs_arg = docs.to_str().unwrap();
+        let (res, folder) = run_init(&tmp, &["--name", "m", "--no-code", "--docs", docs_arg]);
+        res.unwrap();
+        let chunks_before = Store::open(&folder.join("store.db"))
+            .unwrap()
+            .count_notes_kind("chunk")
+            .unwrap();
+        assert!(chunks_before > 0, "doc imported as chunk(s)");
+
+        // Lose the derived index, then repair via a bare re-init.
+        std::fs::remove_file(folder.join("store.db")).unwrap();
+        let (res2, _) = run_init(&tmp, &["--name", "m", "--no-code"]);
+        res2.unwrap();
+
+        // The store is back AND repopulated from imports/ — no manual reindex needed.
+        let chunks_after = Store::open(&folder.join("store.db"))
+            .unwrap()
+            .count_notes_kind("chunk")
+            .unwrap();
+        assert_eq!(
+            chunks_after, chunks_before,
+            "repair rebuilt the document index from md truth"
+        );
+    }
+
+    #[test]
+    fn init_fresh_install_does_not_reindex_documents() {
+        // The repair-reindex must NOT fire on a fresh install (empty notes/ + imports/):
+        // there's nothing to rebuild, so has_md_truth gates it off.
+        let tmp = TempDir::new().unwrap();
+        let folder = tmp.path().join("m");
+        // No docs imported → imports/ and notes/ are empty after init.
+        let (res, _) = run_init(&tmp, &["--name", "m", "--no-code"]);
+        res.unwrap();
+        assert!(!has_md_truth(&folder), "fresh install has no md truth");
+    }
+
+    #[test]
+    fn init_with_docs_imports_into_complete_layout() {
+        // A complete layout + an explicit --docs <paths> must NOT short-circuit: the
+        // named docs are imported into the existing store (the fix for "--docs ignored
+        // on a ready layout"). Prove it by importing into a layout that's already full.
+        let tmp = TempDir::new().unwrap();
+        let (res, folder) = run_init(&tmp, &["--name", "m", "--no-code"]);
+        res.unwrap();
+        // The first init imported nothing (no docs), so the store starts doc-free.
+        let before = read_manifest(&folder).docs.len();
+        assert_eq!(before, 0);
+
+        // A doc to import, named explicitly via an absolute --docs path.
+        let docs = tmp.path().join("extra");
+        std::fs::create_dir(&docs).unwrap();
+        std::fs::write(docs.join("late.md"), "# Late\nadded after init").unwrap();
+        let docs_arg = docs.to_str().unwrap();
+        let (res2, _) = run_init(&tmp, &["--name", "m", "--no-code", "--docs", docs_arg]);
+        res2.unwrap();
+
+        // The doc was imported into the already-complete store: manifest grew and the
+        // imports/ copy exists (rather than an already_exists no-op).
+        let after = read_manifest(&folder);
+        assert_eq!(
+            after.docs.len(),
+            1,
+            "explicit --docs imported into a full layout"
+        );
+        assert_eq!(after.docs[0].import_copy, "late.md");
+        assert!(folder.join("imports").join("late.md").exists());
+    }
+
+    #[test]
+    fn init_reports_already_exists_when_fully_complete() {
+        // A full init followed by a second identical init is a true no-op: the second
+        // run detects a complete layout and returns the already_exists status. Use
+        // --no-code so the layout is deterministically complete (the code index isn't
+        // part of the completeness check).
+        let tmp = TempDir::new().unwrap();
+        let (res, _) = run_init(&tmp, &["--name", "m", "--no-code"]);
+        res.unwrap();
+        // Second run must succeed and must NOT have re-created/duplicated anything; the
+        // key signal is the wired pointer block still appears exactly once.
+        let (res2, _) = run_init(&tmp, &["--name", "m", "--no-code"]);
+        res2.unwrap();
+        let agents = std::fs::read_to_string(tmp.path().join("AGENTS.md")).unwrap();
+        assert_eq!(agents.matches(WIRE_BEGIN).count(), 1);
+    }
+
+    #[test]
+    fn layout_state_probe_and_completeness() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path();
+        let data = target.join("m");
+        let config = target.join("config.json");
+        let exe = if cfg!(windows) { "cm.exe" } else { "cm" };
+
+        // Nothing on disk → every flag false, not present, not complete.
+        let empty = LayoutState::probe(target, &data, &config);
+        assert!(!empty.any_present() && !empty.is_complete(target, "./cm"));
+
+        // A LONE config.json (the after-state of `deinit`, which leaves it) is NOT a
+        // prior init's data: any_present() must stay false, so re-init reads as a fresh
+        // "created", not a "repaired".
+        std::fs::write(&config, "{}").unwrap();
+        let cfg_only = LayoutState::probe(target, &data, &config);
+        assert!(cfg_only.config, "config probed");
+        assert!(
+            !cfg_only.any_present(),
+            "a lone config.json is not 'memory data already here'"
+        );
+        std::fs::remove_file(&config).unwrap();
+
+        // Lay out a fully-complete layout by hand and probe it.
+        std::fs::create_dir_all(data.join("notes")).unwrap();
+        std::fs::create_dir_all(data.join("imports")).unwrap();
+        std::fs::create_dir_all(data.join("models")).unwrap();
+        std::fs::write(data.join("store.db"), "").unwrap();
+        std::fs::write(data.join(".gitignore"), "store.db\n").unwrap();
+        std::fs::write(&config, "{}").unwrap();
+        std::fs::write(target.join(exe), "binary").unwrap();
+        std::fs::write(
+            target.join(".gitignore"),
+            format!("{GITIGNORE_MARKER}\ncm\ncm.exe\n"),
+        )
+        .unwrap();
+        std::fs::write(target.join(CM_GUIDE_NAME), "guide").unwrap();
+        // An instruction file carrying the CURRENT pointer for this exe display.
+        let exe_display = "./cm";
+        std::fs::write(
+            target.join("AGENTS.md"),
+            format!("{AGENTS_HEADER}\n{}\n", entry_point_block(exe_display)),
+        )
+        .unwrap();
+
+        let full = LayoutState::probe(target, &data, &config);
+        assert!(full.any_present());
+        assert!(full.config && full.store && full.dirs && full.data_gitignore);
+        assert!(full.exe && full.root_ignored && full.guide);
+        assert!(
+            full.is_complete(target, exe_display),
+            "all parts present → complete"
+        );
+
+        // A STALE pointer (different exe display) makes it incomplete → re-wire path.
+        assert!(
+            !full.is_complete(target, "./other/cm"),
+            "stale pointer must read as incomplete"
+        );
+
+        // Remove one core piece (store.db) → present-but-incomplete (the repair path).
+        std::fs::remove_file(data.join("store.db")).unwrap();
+        let partial = LayoutState::probe(target, &data, &config);
+        assert!(partial.any_present() && !partial.is_complete(target, exe_display));
     }
 
     #[test]
@@ -2167,16 +2584,10 @@ mod tests {
         let target = Path::new("/proj");
         // Binary at the root → `./cm` (platform separator), short and runnable.
         let exe = target.join("cm.exe");
-        assert_eq!(
-            exe_command_display(target, &exe),
-            format!(".{sep}cm.exe")
-        );
+        assert_eq!(exe_command_display(target, &exe), format!(".{sep}cm.exe"));
         // A binary OUTSIDE the target falls back to its full display path.
         let outside = Path::new("/elsewhere/cm.exe");
-        assert_eq!(
-            exe_command_display(target, outside),
-            display_path(outside)
-        );
+        assert_eq!(exe_command_display(target, outside), display_path(outside));
     }
 
     #[test]

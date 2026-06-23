@@ -135,6 +135,20 @@ cm export md --out memory-dump.md
 prompt or `CLAUDE.md` so the model knows the tool exists and calls `recall` before answering /
 `remember` after decisions.
 
+> **`init` is idempotent — it completes, never clobbers.** Re-running brings the project to a
+> fully-initialized state and touches only what's **missing**: a partial layout (an empty
+> `memory/`, or one whose derived `store.db` was deleted) is finished in place
+> (`{"status":"repaired"}`) — and if `store.db` was gone but the md truth (`notes/` + `imports/`) is
+> still there, init **rebuilds the document index from it automatically**, so `recall` works at once
+> without a manual `cm reindex`. A fresh one gives `{"status":"created"}`, and a layout that's already
+> complete is a true no-op (`{"status":"already_exists"}` — delete the folder to start over, or run
+> `cm reindex` to rebuild just the index). A good `store.db` and an **edited `config.json` are kept
+> verbatim** (re-running with `--model`/`--provider`/… on top of an existing config leaves it
+> unchanged; those flags apply only to a fresh config). Because `deinit` leaves `config.json` behind,
+> re-running `init` after a `deinit` is a fresh `created`, not a repair. An **explicit `--docs <paths>`
+> is honored even on a complete layout** — it imports those paths into the existing store instead of
+> short-circuiting (a bare re-`init` with no `--docs` still no-ops).
+
 > `cm init` narrates its work as numbered steps on **stderr** (`[1/4] Создаю папку памяти…`,
 > `[4/4] Индексирую исходный код… 302 символа в 57 файлах [C# 57]`) and ends with a one-glance
 > summary; the machine-readable JSONL stays on **stdout**.
