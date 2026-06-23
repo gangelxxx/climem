@@ -785,6 +785,11 @@ fn count_md_files(dir: &Path) -> usize {
 
 // ---- map (source-code graph; feature `code`) ------------------------------
 
+/// `meta` key under which `map_tree` records the absolute root of the last-indexed
+/// source tree. A query against an empty/stale graph reads it to auto-re-map that
+/// tree once before giving up (see `auto_remap_for_query`).
+const CODE_ROOT_META_KEY: &str = "code_root";
+
 /// `cm map` drives the code-only knowledge graph (kept separate from the notes
 /// graph: its own code_* tables, reached only here). It has two shapes: an INDEX
 /// shape `cm map <path> [--lang L] [--exclude SUBSTR]`, and a QUERY shape
@@ -802,54 +807,18 @@ pub fn map(p: &Parsed, ctx: &Ctx) -> Result<()> {
     // default they're hidden so listings show a module's real API, not its tests.
     let kind = p.value("kind");
     let tests = p.has("tests");
-    if let Some(name) = p.value("query") {
-        for s in filter_kind(store.code_symbols_by_name(name, tests)?, kind) {
-            print_line(&code_symbol_value(&s));
-        }
-        return Ok(());
-    }
-    if let Some(needle) = p.value("like") {
-        for s in filter_kind(store.code_symbols_like(needle, tests)?, kind) {
-            print_line(&code_symbol_value(&s));
-        }
-        return Ok(());
-    }
-    if p.has("list") {
-        // `--list` with no value = whole graph; an optional `--kind` narrows it.
-        for s in store.code_list(kind, tests)? {
-            print_line(&code_symbol_value(&s));
-        }
-        return Ok(());
-    }
-    if let Some(name) = p.value("uses") {
-        for (caller, line) in store.code_callers_of(name, tests)? {
-            print_line(&json!({
-                "name": caller.name,
-                "kind": caller.kind,
-                "path": caller.path,
-                "line": line,            // where the use occurs
-                "def_line": caller.line, // where the caller itself is defined
-            }));
-        }
-        return Ok(());
-    }
-    if let Some(name) = p.value("calls") {
-        // Outgoing dependencies. Resolved-only by default (unresolved = external /
-        // stdlib names, which are the bulk); --external surfaces those too.
-        let resolved_only = !p.has("external");
-        for (target, line, resolved) in store.code_callees_of(name, resolved_only)? {
-            print_line(&json!({
-                "calls": target,
-                "line": line,
-                "resolved": resolved, // true = links to an in-project definition
-            }));
-        }
-        return Ok(());
-    }
-    if let Some(path) = p.value("defines") {
-        let key = normalize_code_path(path);
-        for s in filter_kind(store.code_symbols_in_like(&key, tests)?, kind) {
-            print_line(&code_symbol_value(&s));
+    // Is this a read-only query (vs the index shape)? If so we run it through
+    // `run_code_query`, which auto-re-maps a stale/empty graph once on an empty hit
+    // before reporting nothing — so the model gets an answer instead of a silent
+    // blank that pushes it back to grep.
+    let query_mode = ["query", "like", "uses", "calls", "defines"]
+        .iter()
+        .any(|f| p.value(f).is_some())
+        || p.has("list");
+    if query_mode {
+        let rows = run_code_query(&store, p, kind, tests, ctx)?;
+        for row in rows {
+            print_line(&row);
         }
         return Ok(());
     }
@@ -894,6 +863,142 @@ pub fn map(p: &Parsed, ctx: &Ctx) -> Result<()> {
         "edges": n_edges,
     }));
     Ok(())
+}
+
+/// Run ONE read-only `cm map` query (--query / --like / --list / --uses / --calls /
+/// --defines) and return its rows as JSON values. On an EMPTY result it tries one
+/// silent re-map of the last-indexed tree (`auto_remap_for_query`) and re-runs the
+/// query — so a stale or never-built graph self-heals instead of handing the model a
+/// blank that sends it back to grep. The re-map happens at most once: if the symbol
+/// is genuinely absent the second run is also empty and we report honestly.
+fn run_code_query(
+    store: &Store,
+    p: &Parsed,
+    kind: Option<&str>,
+    tests: bool,
+    ctx: &Ctx,
+) -> Result<Vec<serde_json::Value>> {
+    let rows = collect_code_query(store, p, kind, tests)?;
+    if !rows.is_empty() {
+        return Ok(rows);
+    }
+    // Empty hit. The graph may simply be stale (files edited since the last map) or
+    // never built in this store. Re-map the remembered tree once, then retry.
+    if auto_remap_for_query(store, ctx)? {
+        return collect_code_query(store, p, kind, tests);
+    }
+    Ok(rows) // nothing to re-map against — the empty result stands.
+}
+
+/// Execute the single active query mode against the graph as-is (no re-mapping) and
+/// collect its rows. Exactly one of the flags is set when this is called (the caller
+/// gated on `query_mode`); `--list` is the fallback. Pure read — same output shape as
+/// the old inline branches.
+fn collect_code_query(
+    store: &Store,
+    p: &Parsed,
+    kind: Option<&str>,
+    tests: bool,
+) -> Result<Vec<serde_json::Value>> {
+    let mut out = Vec::new();
+    if let Some(name) = p.value("query") {
+        for s in filter_kind(store.code_symbols_by_name(name, tests)?, kind) {
+            out.push(code_symbol_value(&s));
+        }
+    } else if let Some(needle) = p.value("like") {
+        for s in filter_kind(store.code_symbols_like(needle, tests)?, kind) {
+            out.push(code_symbol_value(&s));
+        }
+    } else if let Some(name) = p.value("uses") {
+        for (caller, line) in store.code_callers_of(name, tests)? {
+            out.push(json!({
+                "name": caller.name,
+                "kind": caller.kind,
+                "path": caller.path,
+                "line": line,            // where the use occurs
+                "def_line": caller.line, // where the caller itself is defined
+            }));
+        }
+    } else if let Some(name) = p.value("calls") {
+        // Outgoing dependencies. Resolved-only by default (unresolved = external /
+        // stdlib names, which are the bulk); --external surfaces those too.
+        let resolved_only = !p.has("external");
+        for (target, line, resolved) in store.code_callees_of(name, resolved_only)? {
+            out.push(json!({
+                "calls": target,
+                "line": line,
+                "resolved": resolved, // true = links to an in-project definition
+            }));
+        }
+    } else if let Some(path) = p.value("defines") {
+        let key = normalize_code_path(path);
+        for s in filter_kind(store.code_symbols_in_like(&key, tests)?, kind) {
+            out.push(code_symbol_value(&s));
+        }
+    } else {
+        // `--list` with no value = whole graph; an optional `--kind` narrows it.
+        for s in store.code_list(kind, tests)? {
+            out.push(code_symbol_value(&s));
+        }
+    }
+    Ok(out)
+}
+
+/// Strip Windows' `\\?\` verbatim/extended-length prefix for display. `canonicalize`
+/// hands back such paths on Windows; they're correct to STORE and to `exists()`-test,
+/// but ugly in a user-facing note. No-op on non-verbatim paths and other platforms.
+fn display_root(root: &Path) -> String {
+    let s = root.to_string_lossy();
+    s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
+}
+
+/// Re-map the last-indexed source tree (its absolute root, stored in `meta.code_root`
+/// by `map_tree`) so a query that just came back empty can retry against a fresh
+/// graph. Incremental, so an already-current tree costs little. Narrates to STDERR
+/// only (conventions: stdout stays pure JSONL) and never propagates an error — a
+/// re-map failure must not turn a clean "no matches" into a command failure.
+///
+/// Returns `true` if a re-map actually ran (so the caller should retry the query),
+/// `false` if there was nothing to re-map against (no remembered root, or it's gone
+/// from disk) — in which case the empty result is the honest final answer.
+fn auto_remap_for_query(store: &Store, ctx: &Ctx) -> Result<bool> {
+    let root = match store.meta_get(CODE_ROOT_META_KEY)? {
+        Some(r) if !r.is_empty() => PathBuf::from(r),
+        _ => return Ok(false), // never mapped in this store — honest empty result.
+    };
+    let shown = display_root(&root);
+    if !root.exists() {
+        // The remembered tree moved or was deleted; don't guess. The model can
+        // re-run `cm map <path>` with the new location.
+        eprintln!(
+            "note: code graph had no match; its indexed root {shown} is gone — run `cm map <path>`."
+        );
+        return Ok(false);
+    }
+    let mem_dir = ctx
+        .store_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    eprintln!("note: no match in the code graph — re-indexing {shown} (it may be stale)…");
+    match map_tree(store, &root, &mem_dir, None, None, None) {
+        Ok(stats) => {
+            eprintln!(
+                "note: re-indexed; {} file(s) changed — retrying the query.",
+                stats.changed
+            );
+            Ok(true)
+        }
+        Err(e) => {
+            // Best-effort: a re-map failure (e.g. no `code` feature) is reported but
+            // never aborts the query — we just fall back to the empty result.
+            eprintln!("note: could not re-index {shown}: {}", e.msg);
+            if let Some(hint) = &e.hint {
+                eprintln!("note: {hint}");
+            }
+            Ok(false)
+        }
+    }
 }
 
 /// Outcome of indexing a source tree into the code graph.
@@ -1013,6 +1118,16 @@ pub(crate) fn map_tree(
     let name_map = store.code_symbol_name_map()?;
     for src in store.dangling_code_sources()? {
         resolve_code_uses(store, &src, &name_map)?;
+    }
+
+    // Remember the tree we just indexed so a later query against a stale/empty graph
+    // can silently re-map it (auto_remap_for_query). We store the ABSOLUTE path: a
+    // query may run from any working directory, and meta only ever holds one root —
+    // the most recently mapped one, which is the project the user is working in.
+    if let Ok(abs) = std::fs::canonicalize(root) {
+        let _ = store.meta_set(CODE_ROOT_META_KEY, &abs.to_string_lossy());
+    } else {
+        let _ = store.meta_set(CODE_ROOT_META_KEY, &root.to_string_lossy());
     }
 
     Ok(MapStats {
@@ -2148,5 +2263,116 @@ mod tests {
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec!["A.cs"], "obj/ and bin/ must be skipped");
+    }
+
+    #[test]
+    fn display_root_strips_verbatim_prefix() {
+        // Windows canonicalize hands back \\?\C:\... — ugly in a note. Only the
+        // display is cleaned; the stored path keeps the prefix for exists()/open.
+        assert_eq!(display_root(Path::new(r"\\?\C:\proj\src")), r"C:\proj\src");
+        // A normal path is untouched, on every platform.
+        assert_eq!(display_root(Path::new("/proj/src")), "/proj/src");
+    }
+
+    // ---- auto-remap on an empty code query (feature `code`) -------------
+
+    /// `map_tree` records the absolute root it indexed, so a later query can find it.
+    #[cfg(feature = "code")]
+    #[test]
+    fn map_tree_records_code_root_in_meta() {
+        let (mem, ctx) = setup();
+        let proj = TempDir::new().unwrap();
+        std::fs::write(proj.path().join("a.rs"), "pub fn alpha() {}").unwrap();
+        let store = open_store(&ctx);
+        map_tree(&store, proj.path(), mem.path(), None, None, None).unwrap();
+        let root = store.meta_get(CODE_ROOT_META_KEY).unwrap().unwrap();
+        // Stored absolute (canonical when possible), pointing at the indexed tree.
+        assert!(!root.is_empty());
+        assert!(
+            Path::new(&display_root(Path::new(&root))).ends_with(proj.path().file_name().unwrap())
+        );
+    }
+
+    /// The headline behavior: a query against a STALE graph (a symbol added after the
+    /// last map) self-heals — `run_code_query` auto-re-maps the remembered root and
+    /// finds the new symbol, instead of returning the empty list that sends a model
+    /// back to grep.
+    #[cfg(feature = "code")]
+    #[test]
+    fn run_code_query_auto_remaps_stale_graph() {
+        let (mem, ctx) = setup();
+        let proj = TempDir::new().unwrap();
+        let src = proj.path().join("lib.rs");
+        std::fs::write(&src, "pub fn alpha() {}").unwrap();
+        let store = open_store(&ctx);
+        map_tree(&store, proj.path(), mem.path(), None, None, None).unwrap();
+
+        // alpha is present; beta is not (graph is current).
+        assert_eq!(
+            collect_code_query(&store, &parsed(&["map", "--query", "alpha"]), None, false)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            collect_code_query(&store, &parsed(&["map", "--query", "beta"]), None, false)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Edit the file: add beta. The graph is now stale.
+        std::fs::write(&src, "pub fn alpha() {}\npub fn beta() {}").unwrap();
+
+        // A raw query still misses (no re-map)...
+        assert!(
+            collect_code_query(&store, &parsed(&["map", "--query", "beta"]), None, false)
+                .unwrap()
+                .is_empty()
+        );
+        // ...but the self-healing path re-maps the remembered root and finds it.
+        let rows = run_code_query(
+            &store,
+            &parsed(&["map", "--query", "beta"]),
+            None,
+            false,
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1, "auto-remap should surface the new symbol");
+        assert_eq!(rows[0]["name"], "beta");
+    }
+
+    /// A genuinely absent symbol re-maps once and then reports an honest empty result
+    /// (no infinite retry loop).
+    #[cfg(feature = "code")]
+    #[test]
+    fn run_code_query_absent_symbol_stays_empty_after_one_remap() {
+        let (mem, ctx) = setup();
+        let proj = TempDir::new().unwrap();
+        std::fs::write(proj.path().join("lib.rs"), "pub fn alpha() {}").unwrap();
+        let store = open_store(&ctx);
+        map_tree(&store, proj.path(), mem.path(), None, None, None).unwrap();
+
+        let rows = run_code_query(
+            &store,
+            &parsed(&["map", "--query", "nope"]),
+            None,
+            false,
+            &ctx,
+        )
+        .unwrap();
+        assert!(rows.is_empty(), "absent symbol must end empty, not loop");
+    }
+
+    /// With no remembered root (never mapped), `auto_remap_for_query` is a no-op and
+    /// the empty result stands — independent of the `code` feature.
+    #[test]
+    fn auto_remap_no_op_when_no_root_recorded() {
+        let (_mem, ctx) = setup();
+        let store = open_store(&ctx);
+        assert!(
+            !auto_remap_for_query(&store, &ctx).unwrap(),
+            "nothing to re-map against → false"
+        );
     }
 }

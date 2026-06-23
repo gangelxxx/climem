@@ -285,6 +285,10 @@ COMMANDS (full reference)
       vendor, __pycache__, .NET obj/ and bin/, ...) automatically. Source files are
       NOT copied anywhere; the graph is a rebuildable cache over your working tree.
       PRINTS: {"mapped","scanned","changed","files","symbols","edges"}.
+      cm remembers this path: if a later query finds NOTHING, cm silently re-maps
+      this same tree (it may be stale after edits) and retries before answering —
+      so you don't have to re-map by hand after editing. A note on stderr tells you
+      when it did.
 
     QUERY the graph (read-only). Symbol-listing modes accept --kind <k> to keep
     only one kind (function, method, class, interface, module). Test code is HIDDEN
@@ -393,11 +397,13 @@ WHEN TO USE THE CODE MAP (read this — it saves you many tool calls)
       name defined in several files). The map resolves uses BY NAME with no scope
       analysis, so it merges same-named symbols and can miss or misattribute —
       grep is more trustworthy there.
-    * Anything you just edited but haven't re-mapped: the map is a cache; run
-      `cm map <path>` again (it's incremental) or fall back to grep for freshness.
+  Staleness is NO LONGER a reason to skip the map: a query that hits nothing
+  triggers an automatic re-map of the indexed tree and a retry, so just-edited
+  code is picked up for you (a stderr note says so). An empty answer after that
+  means the symbol really isn't there — trust it.
 
-  RULE OF THUMB: unique-ish symbol name + structural question -> `cm map`.
-  Common name, free text, or just-edited code -> grep.
+  RULE OF THUMB: unique-ish symbol name + structural question -> `cm map` (it
+  self-refreshes). Common name or free text -> grep.
 
 ================================================================================
 EMBEDDINGS (how meaning-based search is computed; in config.json)
@@ -455,7 +461,7 @@ pub fn pointer(exe_display: &str) -> String {
          • MEMORY: before answering a project question, `{exe} recall \"<topic>\"` first\n\
          (→ {{\"id\",\"kind\",\"body\"}} per match); after a decision —\n\
          `echo \"<fact>\" | {exe} remember` (text via stdin → {{\"id\"}}).\n\
-         • CODE (sources indexed; re-index after edits — `{exe} map <path>`): for\n\
+         • CODE (sources indexed; self-refreshes on a stale hit — no manual re-map): for\n\
          STRUCTURAL questions use it instead of grep — `{exe} map --query <name>`\n\
          (where defined → {{name,kind,path,line,signature}}), `--uses <name>` (who calls\n\
          it → {{…,def_line}}), `--calls <name>` (deps → {{calls,line,resolved}}),\n\

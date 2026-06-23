@@ -296,7 +296,7 @@ is to answer *structural* questions about a codebase precisely, in one query, in
 of greps: **where is symbol X defined**, **who uses X**, **what does this file define**.
 
 ```bash
-cm map ./src                 # index the tree (re-run after edits; it's incremental)
+cm map ./src                 # index the tree (incremental; self-refreshes on a stale query)
 cm map --query upsert_note   # -> {"name","kind","path","line","signature"}   (where defined)
 cm map --like config         # -> every symbol whose name contains "config"
 cm map --list --kind class   # -> a table of contents: all the types
@@ -316,6 +316,13 @@ deliberately **not** linked to same-named project symbols, so they don't masquer
 revives on a later `map`, exactly like the notes graph). Build/vendor/generated dirs (`target`,
 `node_modules`, `.git`, .NET `obj/` and `bin/`, …) are skipped automatically. Your source files
 are **not** copied anywhere — the graph is a rebuildable cache over your working tree.
+
+**Self-refreshing.** `cm map <path>` remembers the tree it indexed. If a later query
+(`--query`/`--uses`/`--defines`/…) finds **nothing**, `cm` silently re-maps that same tree —
+which may have gone stale after edits — and retries once before answering, printing a short note
+on stderr when it does. So an empty result is trustworthy ("the symbol really isn't there"), and
+you don't have to re-map by hand after editing. (A genuinely-absent symbol re-maps once, then
+returns empty — no retry loop.)
 
 Needs a binary built with the feature (`cargo build --release --features code`); without it,
 `cm map` tells you exactly that.

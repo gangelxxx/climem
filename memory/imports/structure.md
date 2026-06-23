@@ -9,7 +9,7 @@
 |--------|-----------------|------------------|
 | `main.rs` | Точка входа, диспетчер команд, разрешение папки памяти | `run`, `dispatch`, `resolve_dir` |
 | `cli.rs` | Свой парсер аргументов: подкоманды + Windows `/флаг` | `Parsed::parse`, `VALUE_FLAGS`, `arg`/`value`/`has` |
-| `commands.rs` | Хендлеры всех команд; открывают store/config, печатают JSONL | `Ctx` (+`notes_dir`/`imports_dir`/`note_path`), `remember`/`recall`/`get`/`list`/`related`/`forget`/`import`/`reindex`/`map`/`export`/`log`/`config`, `parse_id`, `index_note_best_effort`, `index_note_edges`, `warn_on_drift`; **код-граф:** `map`, **`map_tree`** (переиспользуемое ядро индексации дерева — зовут и `map`, и `init --code`; `MapStats`), `index_code_file`, `enclosing_symbol`, `resolve_code_uses`, `collect_source_files`/`SKIP_DIRS`, `filter_kind`, `code_symbol_value`, `rel_code_path`/`normalize_code_path` |
+| `commands.rs` | Хендлеры всех команд; открывают store/config, печатают JSONL | `Ctx` (+`notes_dir`/`imports_dir`/`note_path`), `remember`/`recall`/`get`/`list`/`related`/`forget`/`import`/`reindex`/`map`/`export`/`log`/`config`, `parse_id`, `index_note_best_effort`, `index_note_edges`, `warn_on_drift`; **код-граф:** `map`, **`map_tree`** (переиспользуемое ядро индексации дерева — зовут и `map`, и `init --code`; пишет `meta.code_root`; `MapStats`), **`run_code_query`/`collect_code_query`/`auto_remap_for_query`/`display_root`** (самозалечивание устаревшего графа на пустой запрос; `CODE_ROOT_META_KEY`), `index_code_file`, `enclosing_symbol`, `resolve_code_uses`, `collect_source_files`/`SKIP_DIRS`, `filter_kind`, `code_symbol_value`, `rel_code_path`/`normalize_code_path` |
 | `config.rs` | `config.json`: типизированный `Config` + raw get/set, маскирование секретов | `Config`, `Embedding`, `Search`, `Chunking`, `default_version` (=2), `load_raw`/`save_raw`, `get_path`/`set_path`, `mask_secrets` |
 | `note.rs` | Формат md-заметки (источник правды): ручной рендер/парс `---`-frontmatter + тело, **без serde_yaml** | `Note`, `render`, `parse` |
 | `store.rs` | SQLite (производный индекс): схема, upsert по hex-id, FTS5, векторы, журнал, импорты, meta, **sync** (хэши файлов), **edges** (граф заметок), **code_\*** (граф кода), `slug` | `Store`, `SCHEMA`, `fresh_id`/`mint_hex`, `upsert_note`, `fts_search`, `all_embeddings`, `ids_matching` (pre-filter), `set_note_slug`/`note_slugs`/`note_ids`, `file_state_*` (sync), `insert_edge`/`edges_from`/`delete_edges_from`, `wipe_derived`, `record_import`/`delete_chunks_for_source`, `meta_get`/`meta_set`; **код-граф:** `code_file_state`/`upsert_code_file`/`code_file_paths`/`delete_code_file`, `insert_code_symbol`/`insert_code_edge`, `code_symbol_name_map`/`dangling_code_sources`/`resolve_code_edge`/`dangle_code_edges_to`, `code_symbols_by_name`/`code_symbols_in`/`code_symbols_in_like`/`code_symbols_like`/`code_list`/`code_callers_of`/`code_callees_of`/`code_counts` |
@@ -218,6 +218,19 @@
   Вывод JSONL `{name,kind,path,line,signature?}` / `{name,kind,path,line,def_line}` (uses) /
   `{calls,line,resolved}` (calls). **Резолв `uses`/`calls` — по имени, без областей:**
   одноимённые символы сливаются, возможен ложный хит (задокументировано в help).
+- **Самозалечивание устаревшего графа (2026-06-23).** Все запросы идут через
+  `commands::run_code_query`: собирает строки текущего режима (`collect_code_query` — одна из
+  веток query/like/list/uses/calls/defines), и **если результат ПУСТ** — один раз зовёт
+  `auto_remap_for_query`, который пере-индексирует запомненное дерево и повторяет запрос.
+  Корень дерева пишет `map_tree` в `meta.code_root` (ключ `CODE_ROOT_META_KEY`) **абсолютным**
+  путём (`canonicalize`, fallback — как есть) при каждом `cm map`/`init --code`; абсолют нужен,
+  чтобы авто-реиндекс работал из любой CWD. `auto_remap_for_query` best-effort: нет `code_root`
+  или дерево исчезло (`!exists()`) → `false` (честный пустой результат, в stderr подсказка
+  `cm map <path>`); реиндекс упал (нет фичи `code`) → warning, тоже `false`. Реиндекс
+  инкрементный — символа реально нет → 2-й прогон тоже пуст, петли нет. Нарратив (note про
+  реиндекс) — только в stderr (stdout — чистый JSONL); путь чистится от `\\?\`-префикса через
+  `display_root`. Чинит корень проблемы «модель видит пустой ответ → решает, что map сломан →
+  уходит в grep до конца сессии».
 - **Тестовый код скрыт по умолчанию.** При парсинге `Def.is_test` (колонка `code_symbols.is_test`):
   `true`, если путь — тест-файл (`code::path_is_test`: `tests/`-сегмент, `_test.go`, `test_*.py`,
   `*.test.ts`…) ИЛИ символ внутри инлайн-тест-модуля (`code::inline_test_from`: строка ≥ первого
