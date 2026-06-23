@@ -17,8 +17,8 @@ READ THIS FIRST (the 6 rules that matter most)
    main loop: recall before you answer, remember after you decide something.
 5. If a command fails, it prints `error: ...` and one correct example to stderr.
    Read the example, copy its shape, run again. One fix is usually enough.
-6. Run any command with no setup? No. First run `cm init <path>` ONCE to create
-   the memory folder. After that all other commands work.
+6. Run any command with no setup? No. First run `cm init` ONCE (from the project
+   root) to create the memory folder. After that all other commands work.
 
 ================================================================================
 WHICH COMMAND DO I USE? (pick by what you want to do)
@@ -29,14 +29,21 @@ WHICH COMMAND DO I USE? (pick by what you want to do)
   Show me the newest notes ....................... list
   What does this note link to? ................... related <id>
   What links TO this note? (backlinks) ........... backlinks <id>
+  Index source code into a dependency graph ...... map <path>
+  Where is symbol X defined? ..................... map --query <name>
+  Find symbols by partial name ................... map --like <substr>
+  List all symbols (a table of contents) ......... map --list [--kind K]
+  Who uses symbol X? ............................. map --uses <name>
+  What does symbol X depend on? .................. map --calls <name>
+  What does file F define? ....................... map --defines <file>
   Delete a note .................................. forget <id>
   Load a whole document (md/txt/html/pdf) ........ import <file>
   Rebuild search after editing files by hand ..... reindex
   Save/print a backup of everything .............. export <format>
   See what happened recently ..................... log
   Read or change settings ........................ config
-  Set up a brand-new memory folder ............... init <path>
-  Remove cm's traces (keep your md) .............. deinit <path>
+  Set up a brand-new memory folder ............... init   (bare; defaults to here)
+  Uninstall: restore docs, remove memory ......... deinit <path>
 
 ================================================================================
 HOW TO CALL IT
@@ -58,37 +65,98 @@ COMMANDS (full reference)
 
   init  — create a new memory folder. Run this once before anything else.
   ----
-    cm init <path> [--name <name>] [--provider local|api] [--model <m>]
-                   [--dimension <n>] [--endpoint <url>]
-    Creates <path>/ with: a copy of the cm binary, an empty notes/ folder, an
-    empty imports/ folder, an empty store.db index, and a config.json.
-    If the folder already exists it is LEFT ALONE and you get
-      {"status":"already_exists"}.
-    If <path> (or any subfolder) already holds .md files, init offers (y/N) to
-    import the whole tree at once, then to delete the originals.
+    cm init [<path>] [--name <name>] [--docs <p1,p2,...>] [--provider local|api]
+            [--model <m>] [--dimension <n>] [--endpoint <url>] [--no-code]
+    With NO arguments, init does the sensible default: in the current working
+    directory (the project root you ran it from, no matter where the cm binary
+    itself sits) it leaves cm + config.json AT THE ROOT and puts the data in a
+    `memory/` subfolder, gathers the project's docs, and indexes its source code.
+    So the whole setup is just:  cm init
+    <path> overrides the target directory; --name overrides the data folder name
+    (default `memory`).
+    LAYOUT. At the root: cm(.exe) + config.json (config records data_dir=<name>, so
+    the binary finds its data). In <path>/<name>/: notes/, imports/, store.db,
+    models/. cm reads config.json next to itself to locate the data — no --dir
+    needed once it's at the root. init also drops a snapshot manifest
+    (<name>/.init-manifest.json) recording what it changed — the root .gitignore it
+    touched, an AGENTS.md it created, and each imported doc's original path — so
+    `deinit` can roll the project back exactly.
+    IDEMPOTENT. init brings the project to a fully-initialized state and touches only
+    what is MISSING. A partial layout (e.g. an empty `memory/`, or one whose derived
+    store.db was deleted) is COMPLETED in place — each piece is created only if absent,
+    so a good store.db and a user-edited config.json are never overwritten ({"status":
+    "repaired"}). If store.db was missing and the md truth (notes/ + imports/) is still
+    there, init also REBUILDS the document index from it automatically, so `recall` works
+    right away without a manual `cm reindex`. A FRESH layout gives {"status":"created"} — and since `deinit` leaves
+    config.json behind, re-running init after a deinit is a fresh "created", not a
+    repair. Only when EVERYTHING is already present and current is it a true no-op:
+    {"status":"already_exists"} (pass --docs <paths> to import more, delete the folder to
+    start over, or `cm reindex` to rebuild just the index). An EXPLICIT --docs is honored
+    even on a complete layout — it imports those paths into the existing store instead of
+    short-circuiting. An existing config.json is always kept verbatim — re-running with
+    --model/--provider/etc. on top of one leaves it unchanged (those flags only apply to
+    a fresh config).
+    DOCS. By default init auto-scans the target for .md files and, if it finds any,
+    lists the folders they live in and asks ONE y/N before importing the lot. The
+    project's ROOT entry-point files (README.md and the agent-instruction docs
+    below) are NOT imported — they get a pointer wired in instead. To pick the docs
+    yourself and skip the scan + prompt, pass --docs with a comma-separated list of
+    folders and/or files (folders are walked recursively; a named folder's README
+    IS included — you asked for it):
+      cm init --docs docs,notes/spec.md
+    After a successful import init also offers (y/N) to delete the originals
+    (recorded in the manifest, so `deinit` puts them back).
     It also wires up the agent's instruction files if any are present
     (CLAUDE.md, AGENTS.md, AGENT.md, GEMINI.md, .cursorrules,
     .github/copilot-instructions.md): a short pointer block is APPENDED to each,
     telling the model to fetch project docs via `cm recall` instead of reading
     them whole. Re-running is safe: an identical block is left untouched, and a
     stale one (e.g. a re-init under a new --name) is refreshed in place — never
-    duplicated. init never creates a file that isn't already there.
+    duplicated. If NONE of those files exist, init CREATES an AGENTS.md (a short
+    header + the pointer block) so a model has an entry point. An existing file is
+    only edited, never overwritten; the manifest records an AGENTS.md init created
+    so `deinit` removes exactly that one.
+    GUIDE. init also drops a standalone CM_GUIDE.md at the root: a full, self-contained
+    manual for cm (with the exact JSON each command returns) that the wired pointer
+    blocks link to, so any coding agent can read it as a plain file instead of spending
+    a turn on `cm help`. An existing CM_GUIDE.md is left untouched; one init created is
+    recorded in the manifest and removed by `deinit`.
+    CODE INDEX (on by default): init also maps the project's source into the code
+    graph (same as running `cm map <path>` after init), so `cm map --query/--uses/
+    --defines` work immediately. Adds {"code":{"files","symbols","edges"}} to the
+    output. Needs a binary built with the `code` feature; without it, init warns
+    and still scaffolds. --no-code skips this step (a docs-only setup).
+    Example:  cm init                 (scaffold here + gather docs + map source)
+    Example:  cm init --docs docs,notes/spec.md   (import exactly these, no prompt)
     Example:  cm init ./project-memory --name project-memory
+    Example:  cm init --no-code       (docs-only, skip the code map)
 
-  deinit  — remove cm's derived traces from a project (the reverse of init).
+  deinit  — full rollback of init: restore your project, uninstall cm.
   ------
-    cm deinit <path> [--name <name>] [--yes]
-    Use the SAME <path> and --name you gave init. Removes only the rebuildable
-    bits: store.db (+ -wal/-shm), config.json, the .gitignore init wrote, the
-    models/ weights, and the pointer blocks it appended to CLAUDE.md / AGENTS.md /
-    etc. It KEEPS your source of truth — notes/*.md and imports/* — and the cm
-    binary copy (delete that by hand; a running .exe can't remove itself on
-    Windows). If the folder ends up empty it is removed too.
+    cm deinit [<path>] [--name <name>] [--yes]
+    With NO arguments it acts on the current directory — the mirror of a bare
+    `cm init`. <path> overrides the target (the same one you gave init); the data
+    folder is found from config.json, so --name is only a fallback. It undoes init
+    exactly, leaving only cm(.exe) and config.json:
+      * strips the pointer blocks from CLAUDE.md / AGENTS.md / etc., and removes an
+        AGENTS.md (and the CM_GUIDE.md) that init itself created;
+      * restores every imported doc — to its original path if that spot is free,
+        else under <dir>/climem/<file> (so your newer file is never overwritten);
+        docs added later via `cm import` go to docs/climem/;
+      * restores the root .gitignore to its pre-init bytes, or deletes it if init
+        created it;
+      * removes the data folder (memory/) ENTIRELY — store.db, notes/, imports/,
+        models/, the manifest.
+    The cm binary stays (a running .exe can't delete itself on Windows; remove it
+    by hand). With no manifest (a store from before this existed) it falls back:
+    imported copies are restored by name into docs/climem/, and only cm's own block
+    is stripped from the root .gitignore.
     Asks for confirmation first; --yes (or --force) skips the prompt. A piped/
-    non-interactive stdin declines safely (nothing is removed without a yes).
-    PRINTS: {"deinit":"<folder>","removed":[…],"unwired_files":N,
-             "folder_removed":bool}.
-    Example:  cm deinit ./project-memory --name project-memory --yes
+    non-interactive stdin declines safely (nothing is touched without a yes).
+    PRINTS: {"deinit":"<folder>","unwired_files":N,"restored_docs":[…],
+             "gitignore":"restored|deleted|untouched","folder_removed":bool,
+             "manifest":bool}.
+    Example:  cm deinit ./project-memory --yes
 
   remember  — save one note. THE TEXT COMES FROM STDIN.
   --------
@@ -199,11 +267,63 @@ COMMANDS (full reference)
     rebuildable index, so this command can always restore search from the files.
     Example:  cm reindex
 
+  map  — build & query a SEPARATE knowledge graph of your SOURCE CODE.
+  ---
+    This graph is NOT your notes. It is a code map: which symbols (functions,
+    types, classes...) exist, where each is defined, and which symbol uses which.
+    It lives in its own tables and never mixes into recall/related. Use it to
+    answer structural questions about a codebase precisely, in one query.
+    (Only works if cm was built with the `code` feature; otherwise it tells you
+    how to rebuild. Languages: Rust, Python, JS, TS, Go, Java, C, C++, C#, Ruby,
+    PHP — picked by file extension.)
+
+    INDEX a source tree (run this first, re-run after edits — it's incremental):
+      cm map <path> [--lang <name>] [--exclude <substr>]
+      --lang <name>     index only this language (e.g. rust, python, typescript).
+      --exclude <substr>  skip any path containing this substring.
+      Skips build/vendor/generated dirs (target, node_modules, .git, dist, build,
+      vendor, __pycache__, .NET obj/ and bin/, ...) automatically. Source files are
+      NOT copied anywhere; the graph is a rebuildable cache over your working tree.
+      PRINTS: {"mapped","scanned","changed","files","symbols","edges"}.
+
+    QUERY the graph (read-only). Symbol-listing modes accept --kind <k> to keep
+    only one kind (function, method, class, interface, module). Test code is HIDDEN
+    by default (symbols in tests/ files or inside an inline test module); pass
+    --tests to include it:
+      cm map --query <name>     where a symbol is DEFINED (exact name).
+        -> one line per definition: {"name","kind","path","line","signature"}.
+      cm map --like <substr>    symbols whose NAME contains <substr> (the structural
+        "show me everything called *config*"). Same output shape as --query.
+      cm map --list             every symbol (a table of contents). Add --kind to
+        narrow, e.g. list all the types. Same output shape as --query.
+      cm map --uses <name>      which symbols USE this one (its callers).
+        -> {"name","kind","path","line","def_line"}  (line = the use site).
+      cm map --calls <name>     what this symbol DEPENDS ON (its outgoing calls).
+        -> {"calls","line","resolved"}. By default only in-project calls are shown
+        (resolved=true); add --external to also list stdlib/3rd-party names.
+      cm map --defines <file>   which symbols a file defines (path matched
+        leniently: `code.rs` and `src/code.rs` both work).
+        -> same shape as --query.
+    NOTE: --uses/--calls match by NAME (no scope resolution), so two unrelated
+    symbols sharing a name are merged, and a same-named call may be a false hit.
+    Ubiquitous stdlib method names (map, filter, unwrap, get, clone, ...) are NOT
+    resolved to same-named project symbols, so they don't show up as fake deps.
+    Examples:
+      cm map ./src --lang rust
+      cm map --query upsert_note
+      cm map --like code --kind function
+      cm map --list --kind class      (--tests to include test code)
+      cm map --uses Store
+      cm map --calls reindex_notes
+
   export  — write out a copy of the memory (for backup or sharing).
   ------
     cm export <md|json|jsonl> [--out <file>] [--query "<topic>"]
+              [--limit N] [--tag T] [--origin-prefix P] [--min-score N]
     Pick a format. With --out it writes a file; without --out it prints to the
-    screen. With --query it exports only notes matching that topic.
+    screen. With --query it exports only notes matching that topic; the same
+    pre-filters as `recall` apply (--tag/--origin-prefix/--min-score), and
+    --limit caps the result (default 50).
     Example:  cm export md --out memory-dump.md
 
   log  — show recent activity, or the list of imported documents.
@@ -243,6 +363,43 @@ THE KNOWLEDGE GRAPH (how notes link together)
   dangling ones (the link is still authored in the other note's md).
 
 ================================================================================
+WHEN TO USE THE CODE MAP (read this — it saves you many tool calls)
+================================================================================
+  `cm map` answers STRUCTURAL questions about source code precisely, in ONE call,
+  where a text search (grep) would take several tries and still be noisy. The
+  project is indexed by `cm init` (or re-run `cm map <path>` after edits); prefer
+  the map for:
+
+    "Where is X defined?"            cm map --query X        (1 exact answer, not
+                                                              200 substring hits)
+    "What's in this file / module?"  cm map --defines F      (a clean API list;
+                                                              test code is hidden)
+    "Who calls / uses X?"            cm map --uses X          (each caller named,
+                                                              attributed to its fn)
+    "What does X depend on?"         cm map --calls X         (its real in-project
+                                                              calls; stdlib hidden)
+    "Is there a symbol like ...?"    cm map --like part       (fuzzy name search)
+
+  WHY it beats grep for these: it knows symbol boundaries, so it never matches a
+  name inside a string, a comment, or a longer word; it tells definitions apart
+  from uses and gives you the direction (who-calls vs what-it-calls); and it
+  attributes each use to the enclosing function. One `--uses`/`--calls` replaces
+  reading scattered grep lines and scrolling to see which function each is in.
+
+  WHEN TO STILL USE GREP (be honest about the limits):
+    * Free text, not a symbol: a string literal, an error message, a TODO, a
+      config key, a value in .md/.json/.toml. The map only knows code symbols.
+    * Symbols with very common / overloaded names (new, get, run, handle, or a
+      name defined in several files). The map resolves uses BY NAME with no scope
+      analysis, so it merges same-named symbols and can miss or misattribute —
+      grep is more trustworthy there.
+    * Anything you just edited but haven't re-mapped: the map is a cache; run
+      `cm map <path>` again (it's incremental) or fall back to grep for freshness.
+
+  RULE OF THUMB: unique-ish symbol name + structural question -> `cm map`.
+  Common name, free text, or just-edited code -> grep.
+
+================================================================================
 EMBEDDINGS (how meaning-based search is computed; in config.json)
 ================================================================================
   config key embedding.provider chooses the engine:
@@ -258,19 +415,25 @@ EMBEDDINGS (how meaning-based search is computed; in config.json)
 ================================================================================
 WHERE FILES LIVE
 ================================================================================
-  A memory folder contains:
-    cm(.exe)      a copy of this binary (so the folder is self-contained)
+  `cm init` lays out two places. At the PROJECT ROOT (where you put the binary):
+    cm(.exe)      this binary, stays where you dropped it
+    config.json   settings — includes data_dir, the link to the data folder below
+  And in the DATA folder (memory/ by default, set by config's data_dir):
     notes/        one <id>.md file per note   <- REAL MEMORY, keep it
     imports/      copies of imported documents <- REAL MEMORY, keep it
     store.db      the search index             <- rebuildable, can be deleted
-    config.json   settings
-  Commit notes/ and imports/ to git. store.db can be ignored and rebuilt with
-  `cm reindex`. Point cm at a folder with --dir <path> or the MEMORY_DIR env var.
+    models/       embedding weights            <- re-downloadable
+  Commit config.json + the data folder's notes/ and imports/ to git; store.db is
+  ignored and rebuilt with `cm reindex`. cm finds its data by reading config.json
+  next to the binary (data_dir points at the data folder); --dir <path> or
+  MEMORY_DIR override the location of the folder that holds config.json.
+  (Older single-folder stores still work: a config without data_dir means
+  everything sits in one folder, as before.)
 
 ================================================================================
 A TYPICAL SESSION, START TO FINISH
 ================================================================================
-  cm init ./project-memory --name project-memory
+  cm init                  (from the project root: scaffold + docs + code map)
   echo "Decided: auth uses JWT, refresh token lasts 30 days." \
     | cm remember --tags auth,decision --slug jwt-auth
   cm recall "how does authentication work" --limit 5
@@ -282,11 +445,22 @@ A TYPICAL SESSION, START TO FINISH
 "#;
 
 /// The little pointer you paste into a system prompt or CLAUDE.md (desc.md §8).
+/// Covers the two everyday loops a model needs: memory (recall/remember) and the
+/// code map for structural navigation (init indexes the source tree by default). It
+/// shows the JSON each call returns, so a model can act without first running `cm
+/// help`; the full manual is the generated `CM_GUIDE.md`.
 pub fn pointer(exe_display: &str) -> String {
     format!(
-        "В проекте есть инструмент памяти `{exe}`. Перед ответом по проекту сначала\n\
-         выполняй `{exe} recall \"<тема>\"`. После значимых решений — `{exe} remember`\n\
-         (тело через stdin). Полный контракт: `{exe} help`.",
+        "This project has `{exe}` (memory + code map). Each call prints JSONL — read it.\n\
+         • MEMORY: before answering a project question, `{exe} recall \"<topic>\"` first\n\
+         (→ {{\"id\",\"kind\",\"body\"}} per match); after a decision —\n\
+         `echo \"<fact>\" | {exe} remember` (text via stdin → {{\"id\"}}).\n\
+         • CODE (sources indexed; re-index after edits — `{exe} map <path>`): for\n\
+         STRUCTURAL questions use it instead of grep — `{exe} map --query <name>`\n\
+         (where defined → {{name,kind,path,line,signature}}), `--uses <name>` (who calls\n\
+         it → {{…,def_line}}), `--calls <name>` (deps → {{calls,line,resolved}}),\n\
+         `--defines <file>` (a file's API). Precise for unique names; common names/text — grep.\n\
+         Full manual: open `CM_GUIDE.md` (or `{exe} help`).",
         exe = exe_display
     )
 }
@@ -304,6 +478,7 @@ mod tests {
         );
         assert!(p.contains("recall"));
         assert!(p.contains("remember"));
+        assert!(p.contains("map")); // also points at the code map
         assert!(p.contains("help"));
     }
 
@@ -322,6 +497,7 @@ mod tests {
             "import",
             "export",
             "reindex",
+            "map",
             "log",
             "config",
         ] {

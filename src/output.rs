@@ -242,8 +242,16 @@ pub fn split_tags(tags: &str) -> Vec<String> {
 }
 
 /// Print one compact JSON object on its own line.
+///
+/// Uses `writeln!` rather than `println!` so a closed reader (the normal
+/// `cm recall … | head -1` case) exits cleanly instead of panicking on the
+/// `BrokenPipe` write error with a backtrace.
 pub fn print_line(v: &Value) {
-    println!("{v}");
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    if writeln!(out, "{v}").is_err() {
+        std::process::exit(0);
+    }
 }
 
 #[cfg(test)]

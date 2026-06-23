@@ -31,7 +31,8 @@ pub fn markdown(src: &str, max_words: usize, overlap: usize) -> Vec<Chunk> {
         if trimmed.starts_with('#') {
             // flush previous section
             if !cur_buf.trim().is_empty() {
-                sections.push((cur_path.clone(), cur_buf.clone()));
+                // `cur_buf` is replaced below, so move it out instead of cloning.
+                sections.push((cur_path.clone(), std::mem::take(&mut cur_buf)));
             }
             let level = trimmed.chars().take_while(|c| *c == '#').count();
             let title = trimmed.trim_start_matches('#').trim().to_string();
@@ -41,7 +42,7 @@ pub fn markdown(src: &str, max_words: usize, overlap: usize) -> Vec<Chunk> {
             }
             stack.push((level, title));
             cur_path = stack.iter().map(|(_, t)| t.clone()).collect();
-            cur_buf = String::new();
+            cur_buf.clear();
             cur_buf.push_str(line);
             cur_buf.push('\n');
         } else {
@@ -50,7 +51,8 @@ pub fn markdown(src: &str, max_words: usize, overlap: usize) -> Vec<Chunk> {
         }
     }
     if !cur_buf.trim().is_empty() {
-        sections.push((cur_path.clone(), cur_buf.clone()));
+        // Final flush: both are dead after this, so move rather than clone.
+        sections.push((cur_path, cur_buf));
     }
     if sections.is_empty() {
         return text(src, max_words, overlap);

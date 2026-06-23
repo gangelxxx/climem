@@ -19,14 +19,49 @@ serde_json = "1"
 ureq = { version = "2", default-features = false, features = ["native-tls", "json", "gzip"], optional = true }
 # Optional PDF import (heavier dependency tree; off by default).
 pdf-extract = { version = "0.7", optional = true }
+# Optional source-code knowledge graph (feature `code`): parse source files with
+# tree-sitter and extract a defines/uses graph via each grammar's tags.scm query.
+# Core + the tagging engine bridge through tree-sitter-language, so grammar crates
+# may sit on different minor versions than the 0.26 core without an ABI clash.
+tree-sitter = { version = "0.26", optional = true }
+tree-sitter-tags = { version = "0.26", optional = true }
+tree-sitter-rust = { version = "0.24", optional = true }
+tree-sitter-python = { version = "0.25", optional = true }
+tree-sitter-javascript = { version = "0.25", optional = true }
+tree-sitter-typescript = { version = "0.23", optional = true }
+tree-sitter-go = { version = "0.25", optional = true }
+tree-sitter-java = { version = "0.23", optional = true }
+tree-sitter-c = { version = "0.24", optional = true }
+tree-sitter-cpp = { version = "0.23", optional = true }
+tree-sitter-c-sharp = { version = "0.23", optional = true }
+tree-sitter-ruby = { version = "0.23", optional = true }
+tree-sitter-php = { version = "0.24", optional = true }
 
 [features]
 # `api` is on by default so a standard `cargo build --release` yields a binary
 # that can switch to the neural provider at runtime (config-switchable). `pdf`
-# stays opt-in (heavier dependency tree).
+# and `code` stay opt-in (heavier dependency trees).
 default = ["api"]
 api = ["dep:ureq"]
 pdf = ["dep:pdf-extract"]
+# Source-code graph: pulls the tagging engine plus one grammar per language. All
+# grammars are statically linked, so a `--features code` binary stays portable
+# (no runtime downloads). Add a language = add its crate here + a registry row in code.rs.
+code = [
+    "dep:tree-sitter",
+    "dep:tree-sitter-tags",
+    "dep:tree-sitter-rust",
+    "dep:tree-sitter-python",
+    "dep:tree-sitter-javascript",
+    "dep:tree-sitter-typescript",
+    "dep:tree-sitter-go",
+    "dep:tree-sitter-java",
+    "dep:tree-sitter-c",
+    "dep:tree-sitter-cpp",
+    "dep:tree-sitter-c-sharp",
+    "dep:tree-sitter-ruby",
+    "dep:tree-sitter-php",
+]
 
 [dev-dependencies]
 # E2e of the `cm` binary as a black box (argv, stdin, JSONL, exit codes).

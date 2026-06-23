@@ -155,8 +155,10 @@ pub struct RecallOpts<'a> {
     pub related: Option<&'a str>,
 }
 
-/// The easy entry point: recall with just a `limit` and no filters (used by
-/// `export` and the tests).
+/// The easy entry point: recall with just a `limit` and no filters. Only the
+/// tests use it now (production callers build a full `RecallOpts` and call
+/// `recall_with`), so it's gated to test builds to stay dead-code-clean.
+#[cfg(test)]
 pub fn recall(
     store: &Store,
     embedder: &dyn Embedder,
@@ -205,16 +207,17 @@ pub fn recall_with(
     // --- semantic channel (vector) ---
     let qvec = embedder.embed(query)?;
     let embeds = store.all_embeddings()?;
+    // Move each owned id out; cosine only needs to borrow the vector. `embeds`
+    // is dead after this, so there's no reason to clone the ids.
     let mut cos: Vec<(String, f32)> = embeds
-        .iter()
-        .map(|(id, v)| (id.clone(), cosine(&qvec, v)))
+        .into_iter()
+        .map(|(id, v)| (id, cosine(&qvec, &v)))
         .collect();
     // Rank by cosine descending; tie-break by id so ranks are deterministic.
-    cos.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(Ordering::Equal)
-            .then(a.0.cmp(&b.0))
-    });
+    // `total_cmp` keeps the order total even if a corrupt stored vector makes
+    // `cosine` return NaN (`partial_cmp` would return None there and a NaN
+    // score could jump ahead of legitimately higher-scoring notes).
+    cos.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
     let mut vec_rank: HashMap<String, usize> = HashMap::with_capacity(cos.len());
     for (i, (id, _)) in cos.iter().enumerate() {
         vec_rank.insert(id.clone(), i + 1);
@@ -223,7 +226,8 @@ pub fn recall_with(
     // The candidate set is every embedded id plus every FTS-matched id. We use a
     // BTreeSet so iteration order is stable; a HashMap's random seed would make
     // results wobble between runs.
-    let mut ids: BTreeSet<String> = cos.iter().map(|(id, _)| id.clone()).collect();
+    // `cos` is dead after this, so move its ids into the set rather than cloning.
+    let mut ids: BTreeSet<String> = cos.into_iter().map(|(id, _)| id).collect();
     ids.extend(fts_hits.iter().map(|(id, _)| id.clone()));
     if ids.is_empty() {
         return Ok(Vec::new());
@@ -263,16 +267,18 @@ pub fn recall_with(
     };
 
     let mut scored: Vec<(String, f32, f32, f32, f32)> = Vec::with_capacity(ids.len());
-    for id in &ids {
+    // Consume `ids` (dead afterward): the lookups still borrow each id, only the
+    // final push moves it, so there's no per-candidate clone on this hot path.
+    for id in ids {
         if let Some(set) = &allowed {
-            if !set.contains(id) {
+            if !set.contains(&id) {
                 continue;
             }
         }
-        let fts = fts_rank.get(id).map_or(0.0, |r| wf / (k + *r as f32));
-        let vector = vec_rank.get(id).map_or(0.0, |r| wv / (k + *r as f32));
-        let graph = graph_rank.get(id).map_or(0.0, |r| wg / (k + *r as f32));
-        scored.push((id.clone(), fts + vector + graph, fts, vector, graph));
+        let fts = fts_rank.get(&id).map_or(0.0, |r| wf / (k + *r as f32));
+        let vector = vec_rank.get(&id).map_or(0.0, |r| wv / (k + *r as f32));
+        let graph = graph_rank.get(&id).map_or(0.0, |r| wg / (k + *r as f32));
+        scored.push((id, fts + vector + graph, fts, vector, graph));
     }
 
     // Sort by fused score descending, tie-break by id ascending, which makes the
