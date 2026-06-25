@@ -24,6 +24,8 @@ READ THIS FIRST (the 6 rules that matter most)
 WHICH COMMAND DO I USE? (pick by what you want to do)
 ================================================================================
   I want to save a fact / decision ............... remember   (text on stdin)
+  cm is missing something / could be better ...... feedback   (text on stdin)
+  Show me the feedback collected so far .......... feedback --list
   I want to find notes about a topic ............. recall "<topic>"
   I have an id, give me the whole note ........... get <id>
   Show me the newest notes ....................... list
@@ -174,6 +176,25 @@ COMMANDS (full reference)
     Example:
       echo "Decided: auth uses JWT, refresh token lasts 30 days." \
         | cm remember --tags auth,decision --slug jwt-auth
+
+  feedback  — tell cm's maintainer what the tool is missing or could do better.
+  --------
+    echo "<what's missing / to improve>" | cm feedback [--tags a,b]
+    cm feedback --list [--recent N]
+    Use this whenever cm ITSELF gets in your way: a flag you wished existed,
+    output that was awkward to parse, a command that did the wrong thing, a gap
+    in this help. THE TEXT COMES FROM STDIN, exactly like remember. Your note is
+    saved into THIS project's memory as an ordinary note tagged "cm-feedback"
+    (and stamped with the cm version), so a maintainer can find it later with
+    `cm recall "<topic>" --tag cm-feedback` or `cm feedback --list`. Add your own
+    --tags to mark the area it's about, e.g. --tags map.
+    --list   instead of writing, print the feedback gathered so far, newest
+             first, as compact previews. --recent N caps how many (default 50).
+    PRINTS (when writing):  {"id":"<hex>"}   (the note id, same as remember).
+    Example:
+      echo "cm map --uses misses trait impls; a --kind filter would help" \
+        | cm feedback --tags map
+      cm feedback --list
 
   recall  — search notes by topic. THIS IS THE MAIN READ COMMAND.
   ------
@@ -448,6 +469,7 @@ A TYPICAL SESSION, START TO FINISH
   cm import ./docs/architecture.md --tags spec,architecture
   cm reindex
   cm export md --out memory-dump.md
+  echo "wish cm recall had a --since <date> filter" | cm feedback
 "#;
 
 /// The little pointer you paste into a system prompt or CLAUDE.md (desc.md §8).
@@ -466,6 +488,8 @@ pub fn pointer(exe_display: &str) -> String {
          (where defined → {{name,kind,path,line,signature}}), `--uses <name>` (who calls\n\
          it → {{…,def_line}}), `--calls <name>` (deps → {{calls,line,resolved}}),\n\
          `--defines <file>` (a file's API). Precise for unique names; common names/text — grep.\n\
+         • FEEDBACK: if `{exe}` is missing something or gets in your way, say so — it's saved\n\
+         for the maintainer: `echo \"<what's missing / to improve>\" | {exe} feedback` (→ {{\"id\"}}).\n\
          Full manual: open `CM_GUIDE.md` (or `{exe} help`).",
         exe = exe_display
     )
@@ -485,6 +509,7 @@ mod tests {
         assert!(p.contains("recall"));
         assert!(p.contains("remember"));
         assert!(p.contains("map")); // also points at the code map
+        assert!(p.contains("feedback")); // and at the feedback channel
         assert!(p.contains("help"));
     }
 
@@ -494,6 +519,7 @@ mod tests {
             "init",
             "deinit",
             "remember",
+            "feedback",
             "recall",
             "get",
             "list",

@@ -1142,6 +1142,23 @@ fn cm_guide(exe: &str) -> String {
          re-mapped. Rule of thumb: *unique-ish name + structural question → `{exe} map`;\n\
          common name, free text, or just-edited code → grep.*\n\
          \n\
+         ## Feedback: help improve `{exe}`\n\
+         \n\
+         You are the agent who actually USES this tool, so you see its rough edges before\n\
+         anyone else. When `{exe}` is missing a command or flag, returns output that's\n\
+         awkward to act on, or behaves surprisingly, record it — the text comes from STDIN,\n\
+         exactly like `remember`:\n\
+         ```\n\
+         echo \"cm map --uses misses trait impls; a --kind filter would help\" | {exe} feedback\n\
+         → {{\"id\":\"7f3e9a01\"}}\n\
+         ```\n\
+         It is saved into THIS project's memory as a note tagged `cm-feedback` (stamped\n\
+         with the cm version), so it never gets lost. Add `--tags <area>` to mark what it's\n\
+         about (e.g. `--tags map`). Whoever maintains cm reviews it later with\n\
+         `{exe} feedback --list` (or `{exe} recall \"<topic>\" --tag cm-feedback`). Short,\n\
+         concrete notes about what would have helped are exactly what makes the tool\n\
+         better — don't hold back.\n\
+         \n\
          ## Where things live\n\
          \n\
          At the project root: `{exe}` (the binary) and `config.json` (settings). The data —\n\
@@ -1310,6 +1327,12 @@ fn entry_point_block(exe_display: &str) -> String {
          - `{exe} map --calls <name>`   what it uses   → `{{calls,line,resolved}}`\n\
          Reliable for unique names; for common names (new/get/run), arbitrary text, or\n\
          just-edited code — use grep instead.\n\n\
+         ### FEEDBACK — help make `{exe}` better\n\
+         You are the agent who actually uses this tool, so you hit its rough edges first.\n\
+         If `{exe}` is missing something, gets in your way, or its output is awkward to act\n\
+         on, record it (text via STDIN, like remember) — it's saved to this project's\n\
+         memory for the maintainer, no need to leave your work:\n\
+         `echo \"<what's missing / to improve>\" | {exe} feedback` → `{{\"id\":\"…\"}}`.\n\n\
          ### More\n\
          Full step-by-step contract with examples: open `CM_GUIDE.md` in this project\n\
          (or run `{exe} help`). Both are equivalent — the file needs no extra call.\n\

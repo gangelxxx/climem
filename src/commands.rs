@@ -263,6 +263,117 @@ pub fn remember(p: &Parsed, ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+// ---- feedback ------------------------------------------------------------
+
+/// The reserved tag every `cm feedback` note carries. It keeps the tool's own
+/// usage feedback filterable apart from project knowledge (recall/export/`--list`
+/// all key off it) without a separate store: feedback is just a tagged note, so md
+/// stays the source of truth and `reindex`/`deinit` handle it like any other note.
+pub const FEEDBACK_TAG: &str = "cm-feedback";
+
+/// `feedback`: let the agent USING cm tell its maintainer what the tool is missing
+/// or could do better — recorded straight into THIS project's memory as a normal
+/// note tagged [`FEEDBACK_TAG`], so the loop closes without leaving the CLI. Body
+/// from stdin like `remember`; `--list` switches to read mode (see [`feedback_list`]).
+///
+/// It is deliberately a thin sibling of `remember` (no slug/relations/graph edges —
+/// feedback isn't a knowledge node), plus a version stamp in `source` so a reader
+/// knows which build the feedback was about.
+pub fn feedback(p: &Parsed, ctx: &Ctx) -> Result<()> {
+    if p.has("list") {
+        return feedback_list(p, ctx);
+    }
+    let (store, cfg) = ctx.open()?;
+    let body = read_stdin()?;
+    let body = body.trim_end_matches(['\n', '\r']).to_string();
+    if body.trim().is_empty() {
+        return Err(AppError::with_hint(
+            "feedback reads the note body from stdin, but stdin was empty",
+            "echo \"cm map --uses misses trait impls; a --kind filter would help\" | cm feedback",
+        ));
+    }
+    // Always carry the reserved tag; the model's extra --tags (e.g. an area like
+    // `recall` or `map`) are merged after it so feedback can be sliced finer.
+    let tags = merge_feedback_tags(p.value("tags").unwrap_or(""));
+    // Stamp the cm version, the way an import records its origin — a maintainer
+    // reading the feedback later needs to know which build it was about.
+    let source = format!("cm v{}", env!("CARGO_PKG_VERSION"));
+
+    let id = store.fresh_id()?;
+    let (epoch, iso) = now();
+
+    // md is the commit point (desc.md §3): write the note file FIRST, then index
+    // best-effort — a broken embedder must not cost us the feedback.
+    let note_val = note::Note {
+        id: id.clone(),
+        created: iso.clone(),
+        tags: tags.clone(),
+        source: Some(source.clone()),
+        slug: None,
+        relations: Vec::new(),
+        body: body.clone(),
+    };
+    let md = note::render(&note_val);
+    std::fs::create_dir_all(&ctx.notes_dir)?;
+    std::fs::write(ctx.note_path(&id), &md)?;
+
+    if index_note_best_effort(&store, &cfg, &id, &body, &tags, Some(&source), epoch, &iso) {
+        let rel = format!("notes/{id}.md");
+        let _ = store.file_state_set(
+            &rel,
+            "note",
+            &id,
+            &content_hash_hex(md.as_bytes()),
+            mtime_secs(&ctx.note_path(&id)),
+        );
+    }
+    store.log_op("feedback", Some(&preview(&body, 80)))?;
+    print_line(&json!({ "id": id }));
+    Ok(())
+}
+
+/// `feedback --list`: the read side of the loop — print stored feedback (notes
+/// tagged [`FEEDBACK_TAG`]) newest-first as compact preview lines, so a maintainer
+/// can review it in one call. Reuses the tag pre-filter plus a per-id fetch, so it
+/// needs no new store query. `--recent N` caps the count (default 50).
+fn feedback_list(p: &Parsed, ctx: &Ctx) -> Result<()> {
+    let (store, _cfg) = ctx.open()?;
+    let n = parse_limit(p.value("recent"), 50)?;
+    let ids = store.ids_matching(Some(FEEDBACK_TAG), None)?;
+    let mut rows: Vec<_> = ids
+        .iter()
+        .filter_map(|id| store.get(id).ok().flatten())
+        .collect();
+    // Newest first, tie-broken by id so the order is deterministic. Sort on the ISO
+    // timestamp STRING, not the i64 `created_at` epoch: `reindex` rebuilds notes with
+    // created_at=0 (it preserves only `created_iso`), so an epoch sort would silently
+    // collapse to the random hex-id tie-break after any reindex. ISO-8601
+    // (YYYY-MM-DDTHH:MM:SSZ) sorts chronologically as text and survives reindex.
+    rows.sort_by(|a, b| {
+        b.created_iso
+            .cmp(&a.created_iso)
+            .then_with(|| b.id.cmp(&a.id))
+    });
+    rows.truncate(n);
+    for row in &rows {
+        print_line(&note_preview_value(row));
+    }
+    Ok(())
+}
+
+/// Prepend the reserved [`FEEDBACK_TAG`] to any model-supplied tags, skipping a
+/// duplicate if the model already named it. Comma-joined for the md frontmatter,
+/// the same raw shape `remember` stores.
+fn merge_feedback_tags(extra: &str) -> String {
+    let mut tags = vec![FEEDBACK_TAG.to_string()];
+    for t in extra.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        if !t.eq_ignore_ascii_case(FEEDBACK_TAG) {
+            tags.push(t.to_string());
+        }
+    }
+    tags.join(", ")
+}
+
 // ---- recall --------------------------------------------------------------
 
 pub fn recall(p: &Parsed, ctx: &Ctx) -> Result<()> {
@@ -1611,6 +1722,26 @@ mod tests {
         );
         assert!(parse_relations("").is_empty());
         assert!(parse_relations("garbage, no-colon").is_empty()); // malformed dropped
+    }
+
+    #[test]
+    fn merge_feedback_tags_always_includes_reserved_and_dedupes() {
+        // No extra tags -> just the reserved one.
+        assert_eq!(merge_feedback_tags(""), FEEDBACK_TAG);
+        // Extra tags come after the reserved one, trimmed.
+        assert_eq!(
+            merge_feedback_tags("map, uses"),
+            format!("{FEEDBACK_TAG}, map, uses")
+        );
+        // A model that already named the reserved tag doesn't get it twice
+        // (case-insensitively), in any position.
+        assert_eq!(merge_feedback_tags("CM-Feedback"), FEEDBACK_TAG);
+        assert_eq!(
+            merge_feedback_tags("map, cm-feedback"),
+            format!("{FEEDBACK_TAG}, map")
+        );
+        // Empty/blank entries are dropped.
+        assert_eq!(merge_feedback_tags(" , , "), FEEDBACK_TAG);
     }
 
     #[test]

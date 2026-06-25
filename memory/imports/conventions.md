@@ -105,6 +105,13 @@
   индекса — следующий `reindex` её вернёт.
 - **Прямые правки md видит только `reindex`** (по `content_hash` в таблице `sync`). Правка
   файла мимо инструмента не попадёт в поиск/граф до пересборки — это by design, не баг.
+- **`reindex` обнуляет epoch `created_at`, сохраняя только `created_iso`.** `commands::reindex_notes`
+  передаёт в `upsert_note` `created_at = 0` (восстанавливает лишь ISO-строку из frontmatter `created`).
+  Поэтому **сортировать заметки по свежести надо по строке `created_iso`, не по i64 `created_at`** —
+  иначе после любого `reindex` ключ схлопывается в 0 и порядок падает на случайный tie-break по
+  hex-id (id из `mint_hex` нехронологичны). ISO-8601 `YYYY-MM-DDTHH:MM:SSZ` сортируется
+  лексикографически = хронологически. Поймано ревью на `commands::feedback_list` (см.
+  [notes/decisions.md](notes/decisions.md) «cm feedback»).
 - **`deinit` — полный откат `init`, точность зависит от манифеста.** `init` пишет
   `<data>/.init-manifest.json` (исходные пути импортированных доков, до-init `.gitignore`,
   создавался ли `AGENTS.md`); `deinit` по нему восстанавливает доки на исходные пути, чинит

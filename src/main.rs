@@ -62,6 +62,7 @@ fn run(p: &Parsed) -> Result<()> {
 fn dispatch(cmd: &str, p: &Parsed, ctx: &Ctx) -> Result<()> {
     match cmd {
         "remember" => commands::remember(p, ctx),
+        "feedback" => commands::feedback(p, ctx),
         "recall" => commands::recall(p, ctx),
         "get" => commands::get(p, ctx),
         "list" => commands::list(p, ctx),

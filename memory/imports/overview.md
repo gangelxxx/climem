@@ -1,7 +1,7 @@
 # Обзор и текущее состояние
 
 > Обновляй при бампе версии crate, изменении версии схемы (`config.version` / `SCHEMA`),
-> смене активной задачи. Последняя ревизия: **2026-06-17**.
+> смене активной задачи. Последняя ревизия: **2026-06-25**.
 
 ## Что за проект
 
@@ -78,8 +78,10 @@
   `--no-default-features` / `--all-features`; `cargo clippy -D warnings` чисто.
   Раскладка и команды — в [structure.md](structure.md) «Тесты» и [build.md](build.md).
 - **Не под git** на момент заведения памяти (`git status` → не репозиторий).
-- **Реализовано** всё ядро контракта (`init/remember/recall/get/list/related/forget/import/
-  reindex/export/log/config/help`), оба провайдера эмбеддингов, импорт md/txt/html, граф знаний.
+- **Реализовано** всё ядро контракта (`init/remember/feedback/recall/get/list/related/backlinks/
+  forget/import/reindex/map/export/log/config/deinit/help`), оба провайдера эмбеддингов, импорт
+  md/txt/html, граф знаний, граф кода (фича `code`). `feedback` — канал отзывов модели о самом cm
+  (заметка с тегом `cm-feedback`; см. [notes/decisions.md](notes/decisions.md)).
 - **Точки расширения, ещё не сделанные** (см. [roadmap.md](roadmap.md)): локальная
   нейромодель в процессе (слот под ONNX в `embed/`); PDF импорт/экспорт — за фичей `pdf`
   (по умолчанию выключена). **MCP-режим сознательно вырезан** (2026-06-18) — climem остаётся
@@ -99,6 +101,11 @@
 
 ## Активная задача
 
+- **2026-06-25** — добавлена команда `cm feedback` — канал, которым модель-агент сообщает, чего
+  cm не хватает / что улучшить, прямо в память проекта (заметка с тегом `cm-feedback`, штамп
+  версии в `source`); `feedback --list` читает их обратно. Инструкции вшиты во все три
+  онбординг-поверхности `init` (wired-блок, `CM_GUIDE.md`, `help::pointer`) + `help::HELP` +
+  README. Решение и инварианты — [notes/decisions.md](notes/decisions.md). См. [journal.md](journal.md).
 - **2026-06-17** — заведена папка `memory/` (эта система) по образцу
   [HOWTO-BUILD-MEMORY.md](HOWTO-BUILD-MEMORY.md). См. [journal.md](journal.md).
 - **2026-06-17** — реализован [docs/testing-plan.md](../docs/testing-plan.md): с нуля заведено
