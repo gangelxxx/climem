@@ -1,0 +1,29 @@
+{
+  "name": "memory",
+  "data_dir": "memory",
+  "embedding": {
+    "provider": "local",
+    "model": "hash-ngram-v1",
+    "dimension": 384,
+    "weights_path": "./models",
+    "endpoint": null,
+    "api_key_env": "MEMORY_EMBED_API_KEY",
+    "api_format": "openai"
+  },
+  "search": {
+    "hybrid_weights": {
+      "fts": 0.5,
+      "vector": 0.5,
+      "graph": 0.0
+    },
+    "candidates": 50,
+    "rrf_k": 60,
+    "graph_depth": 2,
+    "graph_predicate": ""
+  },
+  "chunking": {
+    "max_tokens": 200,
+    "overlap": 32
+  },
+  "version": 2
+}

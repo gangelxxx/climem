@@ -46,6 +46,8 @@ const VALUE_FLAGS: &[&str] = &[
     // init: explicit doc paths to import (comma-separated dirs and/or files),
     // bypassing the auto-scan + y/N prompt.
     "docs",
+    // NOTE: `doctor` adds no value-flag — its flags `--fix` and `--text` are both
+    // boolean (parsed via `has(...)`), so they intentionally need no entry here.
 ];
 
 #[derive(Debug, Default)]

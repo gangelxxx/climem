@@ -8,6 +8,7 @@ mod code;
 mod commands;
 mod config;
 mod deinit;
+mod doctor;
 mod embed;
 mod export;
 mod graph;
@@ -75,6 +76,7 @@ fn dispatch(cmd: &str, p: &Parsed, ctx: &Ctx) -> Result<()> {
         "map" => commands::map(p, ctx),
         "log" => commands::log(p, ctx),
         "config" => commands::config(p, ctx),
+        "doctor" => doctor::run(p, ctx),
         unknown => Err(AppError::with_hint(
             format!("unknown command '{unknown}'"),
             "command list: `cm help`.",

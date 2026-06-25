@@ -41,6 +41,7 @@ WHICH COMMAND DO I USE? (pick by what you want to do)
   Delete a note .................................. forget <id>
   Load a whole document (md/txt/html/pdf) ........ import <file>
   Rebuild search after editing files by hand ..... reindex
+  Check & repair the memory ...................... doctor [--fix]
   Save/print a backup of everything .............. export <format>
   See what happened recently ..................... log
   Read or change settings ........................ config
@@ -288,6 +289,38 @@ COMMANDS (full reference)
     rebuildable index, so this command can always restore search from the files.
     Example:  cm reindex
 
+  doctor  — check the memory's health, show stats, and (with --fix) repair it.
+  ------
+    cm doctor [--fix] [--text]
+    A read-only health check by default: it verifies the layout and the derived
+    store.db against the md source of truth, prints project statistics, and for every
+    problem prints the exact command that fixes it. It reads nothing and changes
+    nothing unless you pass --fix. Run it after a move or a lost index, or any time
+    you want a one-glance status.
+    --text prints a READABLE report (aligned ✓/⚠/✗ checks + a formatted stats block)
+    instead of the default JSONL — use it when a human is reading; keep the JSONL
+    default for scripts/agents.
+    CHECKS include: config.json parses; config's data_dir still resolves (catches a
+    RENAMED/moved memory folder); store.db is present and opens (catches a DELETED
+    index); the hand-kept notes<->search-index sync; embedder signature/dimension
+    drift (vectors that no longer compare); store-vs-disk drift (a note in the index
+    with no notes/<id>.md, or an unindexed file); slug collisions; the code graph; and
+    that the agent instruction files (CLAUDE.md/AGENTS.md/…) carry a current pointer to
+    a cm binary that actually EXISTS at the project root.
+    --fix applies ONLY the safe, idempotent repairs, by delegating to existing
+    commands: it creates any missing data dirs and rebuilds the index with `reindex`
+    (or `reindex --all` when an embedder change means everything must be re-embedded),
+    and, when a renamed data folder is unambiguous, points config.data_dir back at it.
+    It never rewrites your tuned config otherwise, never deletes a note, and never
+    touches your instruction files — run `cm init` for the scaffold. Each finding is
+    one JSON line, e.g.:
+      {"check":"store_present","status":"error","fixable":true,"fix":"cm reindex"}
+    followed by statistics ({"stat":"notes","value":42}) and a summary
+    ({"doctor":"<dir>","errors":1,"warnings":0,"info":1,"fixed":0}). Findings are data,
+    so doctor still exits 0 when it finds problems — read the summary counts to react.
+    Example:  cm doctor
+    Example:  cm doctor --fix     (rebuild a lost store.db, or adopt a renamed folder)
+
   map  — build & query a SEPARATE knowledge graph of your SOURCE CODE.
   ---
     This graph is NOT your notes. It is a code map: which symbols (functions,
@@ -529,6 +562,7 @@ mod tests {
             "import",
             "export",
             "reindex",
+            "doctor",
             "map",
             "log",
             "config",

@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "data_dir": "memory",
+  "root_gitignore": {
+    "modified": true,
+    "existed": true,
+    "original": "/target\n# scratch memory stores used for local testing\n/.testmem/\n/.apimem/\n/.codemem/\n# local scaffolded memory store (self-copied binary + store.db + models)\n/cmem/\n# secrets sidecar (desc.md §5) — never commit\nconfig.local.json\n# SQLite side files (should not appear with rollback journal, but just in case)\n*.db-wal\n*.db-shm\n# OS / editor cruft\n.DS_Store\nThumbs.db\n.idea/\n.vscode/\n*.swp\n# Python tooling for scripts/ (bench.py etc.)\n__pycache__/\n*.pyc\n.venv/\nCLAUDE.md\n.gitignore\ndesc.md\nTEST_PLAN.md\ntests\ndocs\nscripts\nmemory/imports/journal-ab58d112.md\n"
+  },
+  "created_agents_md": false,
+  "created_cm_guide": true,
+  "docs": []
+}

@@ -1110,6 +1110,96 @@ impl Store {
             |r| r.get(0),
         )?)
     }
+
+    // ---- integrity probes (read-only; for `cm doctor`) -------------------
+    // These are pure SELECTs that surface the hand-maintained invariants the
+    // store relies on but doesn't enforce with foreign keys. `cm doctor` runs
+    // them to report drift; the fix is always a `reindex` (the store is derived).
+
+    /// `(notes without an fts row, fts rows without a note)` — both should be 0.
+    /// `notes` ↔ `notes_fts` are synced BY HAND (no `content=` table, no FK), so a
+    /// crash mid-write or a manual edit could desync them; doctor checks BOTH
+    /// directions because each catches a different half-write.
+    pub fn fts_desync_counts(&self) -> Result<(i64, i64)> {
+        let notes_only: i64 = self.conn.query_row(
+            "SELECT count(*) FROM notes n
+               LEFT JOIN notes_fts f ON f.rowid = n.rowid
+              WHERE f.rowid IS NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        let fts_only: i64 = self.conn.query_row(
+            "SELECT count(*) FROM notes_fts f
+               LEFT JOIN notes n ON n.rowid = f.rowid
+              WHERE n.rowid IS NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok((notes_only, fts_only))
+    }
+
+    /// Count of RESOLVED note-graph edges whose target note no longer exists.
+    /// Dangling edges (`dst_id IS NULL`) are first-class (forward refs) and are
+    /// excluded — only a non-null `dst_id` pointing nowhere is the inconsistency
+    /// (a delete that failed to re-dangle its inbound edges).
+    pub fn resolved_edge_orphans(&self) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT count(*) FROM edges
+              WHERE dst_id IS NOT NULL AND dst_id NOT IN (SELECT id FROM notes)",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// All note ids of a given `kind` (e.g. `note`, `chunk`), for store↔disk drift
+    /// checks (a DB row whose `notes/<id>.md` is gone, or vice-versa).
+    pub fn note_ids_of_kind(&self, kind: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT id FROM notes WHERE kind = ?1")?;
+        let rows = stmt
+            .query_map(params![kind], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// `(count of notes carrying an embedding, the DISTINCT byte-lengths of those
+    /// blobs)`. Each f32 is 4 bytes, so a length is `dimension * 4`; doctor flags a
+    /// length not divisible by 4 (corrupt blob) or a dimension that disagrees with
+    /// `config.embedding.dimension` (embedder drift — cosine silently scores 0).
+    pub fn embedding_stats(&self) -> Result<(i64, Vec<i64>)> {
+        let count: i64 = self.conn.query_row(
+            "SELECT count(*) FROM notes WHERE embedding IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT length(embedding) FROM notes
+              WHERE embedding IS NOT NULL ORDER BY 1",
+        )?;
+        let lengths = stmt
+            .query_map([], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((count, lengths))
+    }
+
+    /// Code-graph orphans: `(symbols whose file is gone from code_files, resolved
+    /// `uses` edges whose target symbol_id is gone)`. Both should be 0 after a clean
+    /// `map`; non-zero means a prune that didn't cascade. (Tables always exist even
+    /// without the `code` feature, so this is always safe to call — it returns 0,0.)
+    pub fn code_orphans(&self) -> Result<(i64, i64)> {
+        let sym: i64 = self.conn.query_row(
+            "SELECT count(*) FROM code_symbols
+              WHERE path NOT IN (SELECT path FROM code_files)",
+            [],
+            |r| r.get(0),
+        )?;
+        let edge: i64 = self.conn.query_row(
+            "SELECT count(*) FROM code_edges
+              WHERE dst IS NOT NULL AND dst NOT IN (SELECT symbol_id FROM code_symbols)",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok((sym, edge))
+    }
 }
 
 fn map_import(r: &rusqlite::Row<'_>) -> rusqlite::Result<ImportRow> {
@@ -1280,6 +1370,67 @@ mod tests {
     #[test]
     fn forget_missing_id_returns_false_no_error() {
         assert!(!mem().forget("ffffffff").unwrap());
+    }
+
+    // ---- integrity probes (cm doctor) -----------------------------------
+
+    #[test]
+    fn fts_desync_counts_zero_when_synced_and_detects_break() {
+        let s = mem();
+        ins(&s, "alpha");
+        ins(&s, "beta");
+        assert_eq!(s.fts_desync_counts().unwrap(), (0, 0));
+        // Drop the fts side by hand to simulate a half-write: every note now lacks
+        // its fts row (notes_only = 2), nothing orphaned the other way.
+        s.conn.execute("DELETE FROM notes_fts", []).unwrap();
+        assert_eq!(s.fts_desync_counts().unwrap(), (2, 0));
+    }
+
+    #[test]
+    fn note_ids_of_kind_filters_by_kind() {
+        let s = mem();
+        let n = ins(&s, "a note");
+        s.insert_note("a chunk", "", None, None, "chunk", &[0.0])
+            .unwrap();
+        assert_eq!(s.note_ids_of_kind("note").unwrap(), vec![n]);
+        assert_eq!(s.note_ids_of_kind("chunk").unwrap().len(), 1);
+        assert!(s.note_ids_of_kind("nope").unwrap().is_empty());
+    }
+
+    #[test]
+    fn embedding_stats_counts_and_distinct_lengths() {
+        let s = mem();
+        // `ins` stores a 2-float embedding -> 8 bytes.
+        ins(&s, "x");
+        ins(&s, "y");
+        assert_eq!(s.embedding_stats().unwrap(), (2, vec![8]));
+        // A different dimension shows up as a second distinct length (drift).
+        s.insert_note("z", "", None, None, "note", &[1.0, 2.0, 3.0])
+            .unwrap();
+        assert_eq!(s.embedding_stats().unwrap(), (3, vec![8, 12]));
+    }
+
+    #[test]
+    fn resolved_edge_orphans_counts_only_broken_resolved_edges() {
+        let s = mem();
+        let a = ins(&s, "target");
+        let b = ins(&s, "source");
+        // A healthy resolved edge b -> a, plus a dangling one (excluded).
+        s.insert_edge(&b, "links_to", Some(&a), &a, "wikilink")
+            .unwrap();
+        s.insert_edge(&b, "links_to", None, "ghost", "wikilink")
+            .unwrap();
+        assert_eq!(s.resolved_edge_orphans().unwrap(), 0);
+        // A resolved edge whose target id doesn't exist is the inconsistency.
+        s.insert_edge(&b, "rel", Some("deadbeef"), "deadbeef", "relation")
+            .unwrap();
+        assert_eq!(s.resolved_edge_orphans().unwrap(), 1);
+    }
+
+    #[test]
+    fn code_orphans_zero_on_empty_graph() {
+        // No code feature / empty graph: the queries are still valid and yield 0,0.
+        assert_eq!(mem().code_orphans().unwrap(), (0, 0));
     }
 
     #[test]

@@ -242,6 +242,19 @@ pub fn run(p: &Parsed) -> Result<()> {
     // manual it can open as a file, with no `cm help` round-trip. Tracked for rollback.
     let created_cm_guide = write_cm_guide(target, &exe_display);
 
+    // Sanity-check the wiring we just wrote: the pointers tell the agent to run the
+    // binary from the project root, so make sure it's actually there. If the self-copy
+    // above failed, the instructions would point at a binary that isn't present — say
+    // so loudly rather than leave a broken pointer. (This is exactly what `cm doctor`'s
+    // `agent_wiring` check re-verifies later.)
+    if !exe_dest.is_file() {
+        eprintln!(
+            "      warning: the instruction files point at `{exe_display}`, but no cm binary \
+             is there — place cm at {} so the pointers resolve.",
+            target.to_string_lossy()
+        );
+    }
+
     // [4/N] Index the project's source tree into the code graph (default on), so a
     // bare `cm init` gives an immediately-queryable map. `--no-code` skips it.
     // Best-effort: the scaffold already succeeded, so a missing `code` feature or a
@@ -436,6 +449,67 @@ fn instruction_pointer_current(target: &Path, exe_display: &str) -> bool {
             .map(|text| text.contains(&block))
             .unwrap_or(false)
     })
+}
+
+/// Read-only wiring/scaffold health for `cm doctor`. Reports the agent-facing wiring
+/// (does the cm binary sit where the instruction files point, and do those files carry
+/// a CURRENT pointer block) plus the cosmetic scaffold extras (gitignore rules, guide).
+/// It reuses the SAME `LayoutState` probe `init` heals from, so `doctor` reports exactly
+/// what `init` would complete — without duplicating the check or running init's repair.
+/// `data_folder` is the resolved data dir (config's `data_dir`).
+pub(crate) struct LayoutStatus {
+    /// How the wired pointers spell the binary as a command (e.g. `.\cm.exe`).
+    pub exe_display: String,
+    /// The cm binary sits at the project root, where the pointers tell the agent to
+    /// run it. The crux of the "instructions point at a binary that isn't there" check.
+    pub binary_present: bool,
+    /// The root `.gitignore` ignores the (large, rebuildable) binary.
+    pub root_ignored: bool,
+    /// The data folder's own `.gitignore` is present.
+    pub data_gitignore: bool,
+    /// `CM_GUIDE.md` is at the root.
+    pub guide_present: bool,
+    /// Entry-point instruction files that exist at all (CLAUDE.md/AGENTS.md/…).
+    pub instruction_files: Vec<&'static str>,
+    /// …of those, the ones carrying a CURRENT cm pointer block (byte-identical to what
+    /// `init` would wire for `exe_display`). A present file NOT in here is unwired/stale.
+    pub wired_files: Vec<&'static str>,
+}
+
+/// Probe the project layout rooted at `root` (config + binary) with data under
+/// `data_folder`, the read-only mirror of `init`'s wiring decision.
+pub(crate) fn layout_status(root: &Path, data_folder: &Path) -> LayoutStatus {
+    let config_path = root.join("config.json");
+    let pre = LayoutState::probe(root, data_folder, &config_path);
+    let exe_name = if cfg!(windows) { "cm.exe" } else { "cm" };
+    let exe_display = exe_command_display(root, &root.join(exe_name));
+    let block = entry_point_block(&exe_display);
+    let mut instruction_files = Vec::new();
+    let mut wired_files = Vec::new();
+    for rel in ENTRY_POINT_NAMES {
+        let path = rel
+            .split('/')
+            .fold(root.to_path_buf(), |p, seg| p.join(seg));
+        if !path.is_file() {
+            continue;
+        }
+        instruction_files.push(*rel);
+        if std::fs::read_to_string(&path)
+            .map(|t| t.contains(&block))
+            .unwrap_or(false)
+        {
+            wired_files.push(*rel);
+        }
+    }
+    LayoutStatus {
+        exe_display,
+        binary_present: pre.exe,
+        root_ignored: pre.root_ignored,
+        data_gitignore: pre.data_gitignore,
+        guide_present: pre.guide,
+        instruction_files,
+        wired_files,
+    }
 }
 
 /// Emit one numbered step header to stderr: `[2/4] Collecting documentation`.
@@ -1451,7 +1525,7 @@ fn is_root_entry_point(name: &str) -> bool {
 /// layout has `store.db` + `config.json` together. Requiring `imports/` (or
 /// config.json) alongside `store.db` avoids matching a random folder that merely
 /// happens to hold a file named store.db.
-fn is_memory_folder(dir: &Path) -> bool {
+pub(crate) fn is_memory_folder(dir: &Path) -> bool {
     let has_store = dir.join("store.db").is_file();
     has_store && (dir.join("imports").is_dir() || dir.join("config.json").is_file())
 }
