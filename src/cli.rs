@@ -31,9 +31,11 @@ const VALUE_FLAGS: &[&str] = &[
     // graph traversal (`related`): --depth N, --predicate P (--all is boolean)
     "depth",
     "predicate",
-    // graph authoring on `remember`: --slug S, --relations "p:t,p:t"
+    // graph authoring on `remember`: --slug S, --relations "p:t,p:t",
+    // --code-refs "sym,sym" (anchors into the code graph, resolved at recall)
     "slug",
     "relations",
+    "code-refs",
     // graph re-rank channel for `recall`: --related <id>
     "related",
     // code graph (`map`): index with --lang/--exclude; query with

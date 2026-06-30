@@ -30,8 +30,23 @@ pub struct Note {
     pub slug: Option<String>,
     /// `(predicate, target)` relation edges authored in frontmatter (graph layer).
     pub relations: Vec<(String, String)>,
+    /// Names of source-code symbols this note documents (the `code:` frontmatter
+    /// field). They're anchors into the code graph: at `recall` each is resolved
+    /// live against `code_symbols`, so a note can tell whether the code it describes
+    /// still exists. Authored by name (not path:line) so it survives line shifts.
+    pub code_refs: Vec<String>,
     /// The note text (frontmatter stripped, surrounding blank lines trimmed).
     pub body: String,
+}
+
+/// Split a `code:`/`--code-refs` value (`"a, b , c"`) into clean symbol names,
+/// dropping blanks. Shared by the md parser and the `remember` CLI so both agree.
+pub fn split_code_refs(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
 }
 
 /// Render a note to its on-disk md form. The key order is fixed (so the bytes
@@ -55,6 +70,9 @@ pub fn render(note: &Note) -> String {
         for (pred, target) in &note.relations {
             s.push_str(&format!("  - {pred}: {target}\n"));
         }
+    }
+    if !note.code_refs.is_empty() {
+        s.push_str(&format!("code: {}\n", note.code_refs.join(", ")));
     }
     s.push_str("---\n");
     s.push_str(note.body.trim_matches(|c| c == '\n' || c == '\r'));
@@ -109,6 +127,7 @@ pub fn parse(text: &str) -> Result<Note> {
                     "tags" => note.tags = val.to_string(),
                     "source" => note.source = some_nonempty(val),
                     "slug" => note.slug = some_nonempty(val),
+                    "code" => note.code_refs = split_code_refs(val),
                     "relations" => in_relations = true, // items on following lines
                     _ => {}
                 }
@@ -144,6 +163,7 @@ mod tests {
                 ("depends_on".into(), "db-schema".into()),
                 ("supersedes".into(), "id:9f8e7d".into()),
             ],
+            code_refs: vec!["validate_token".into(), "JwtAuth".into()],
             body: "Решили: авторизацию делаем на JWT. См. [[db-schema]].".into(),
         }
     }
@@ -164,7 +184,42 @@ mod tests {
         assert!(text.contains("\nslug: jwt-auth\n"));
         assert!(text.contains("\nsource: manual\n"));
         assert!(text.contains("relations:\n  - depends_on: db-schema\n  - supersedes: id:9f8e7d\n"));
+        // `code:` follows the relations block, comma-joined like tags.
+        assert!(text.contains("\ncode: validate_token, JwtAuth\n"));
         assert!(text.ends_with("\n"));
+    }
+
+    #[test]
+    fn render_omits_empty_code_refs() {
+        let n = Note {
+            id: "ff00".into(),
+            created: "2026-06-17T00:00:00Z".into(),
+            body: "bare".into(),
+            ..Default::default()
+        };
+        assert!(!render(&n).contains("code:"));
+    }
+
+    #[test]
+    fn parse_code_refs_splits_and_trims() {
+        let n =
+            parse("---\nid: a1\ncreated: t\ncode: validate_token,  JwtAuth , \n---\nx").unwrap();
+        assert_eq!(n.code_refs, vec!["validate_token", "JwtAuth"]);
+    }
+
+    #[test]
+    fn parse_code_after_relations_block_ends_it() {
+        // A `code:` key right after the relations block must be read as a key, not
+        // swallowed as a relations item.
+        let n = parse(
+            "---\nid: a1\ncreated: t\nrelations:\n  - documents: foo\ncode: bar, baz\n---\nx",
+        )
+        .unwrap();
+        assert_eq!(
+            n.relations,
+            vec![("documents".to_string(), "foo".to_string())]
+        );
+        assert_eq!(n.code_refs, vec!["bar", "baz"]);
     }
 
     #[test]

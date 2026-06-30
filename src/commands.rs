@@ -201,6 +201,9 @@ pub fn remember(p: &Parsed, ctx: &Ctx) -> Result<()> {
     let source = p.value("source");
     let slug = p.value("slug").filter(|s| !s.is_empty());
     let relations = parse_relations(p.value("relations").unwrap_or(""));
+    // `--code-refs "name,name"`: names of code symbols this note documents. Stored
+    // by name and resolved against the code graph at recall time (see resolve_code_refs).
+    let code_refs = note::split_code_refs(p.value("code-refs").unwrap_or(""));
 
     let id = store.fresh_id()?;
     let (epoch, iso) = now();
@@ -215,6 +218,7 @@ pub fn remember(p: &Parsed, ctx: &Ctx) -> Result<()> {
         source: source.map(|s| s.to_string()),
         slug: slug.map(|s| s.to_string()),
         relations,
+        code_refs: code_refs.clone(),
         body: body.clone(),
     };
     let md = note::render(&note_val);
@@ -269,6 +273,7 @@ pub fn remember(p: &Parsed, ctx: &Ctx) -> Result<()> {
             }
         }
         let _ = store.set_note_slug(&id, slug); // make this note linkable by slug right away
+        let _ = store.set_note_code_refs(&id, &code_refs); // anchors into the code graph
 
         // Derive the outgoing edges from --relations and the body's [[wiki-links]].
         // Best-effort: targets resolve against the notes we know about right now and
@@ -331,6 +336,7 @@ pub fn feedback(p: &Parsed, ctx: &Ctx) -> Result<()> {
         source: Some(source.clone()),
         slug: None,
         relations: Vec::new(),
+        code_refs: Vec::new(),
         body: body.clone(),
     };
     let md = note::render(&note_val);
@@ -458,8 +464,17 @@ pub fn recall(p: &Parsed, ctx: &Ctx) -> Result<()> {
     let hits = search::recall_with(&store, emb.as_ref(), &cfg, query, &opts)?;
     store.log_op("recall", Some(query))?;
 
+    // Doc↔code: a note's authored `code:` anchors are resolved live against the code
+    // graph and attached as `code_refs` (default shape only — `--fields` is an exact
+    // projection). `resolved:false` flags a stale anchor; if the graph was never
+    // built, every anchor reads false, so nudge once instead of crying wolf.
+    let code_graph_built = store
+        .code_counts()
+        .map(|(_, sym, _)| sym > 0)
+        .unwrap_or(false);
+    let mut warned_no_code_graph = false;
     for h in &hits {
-        print_line(&output::recall_value(
+        let mut v = output::recall_value(
             &h.row,
             h.score,
             h.fts,
@@ -468,9 +483,56 @@ pub fn recall(p: &Parsed, ctx: &Ctx) -> Result<()> {
             fields.as_deref(),
             explain,
             body_budget,
-        ));
+        );
+        if fields.is_none() {
+            if let Some(refs) = resolve_code_refs(&store, &h.row.id)? {
+                if !code_graph_built && !warned_no_code_graph {
+                    eprintln!(
+                        "note: a recalled note has code anchors but the code graph is empty — \
+                         run `cm map <path>` (or `cm init --code`) so they resolve."
+                    );
+                    warned_no_code_graph = true;
+                }
+                v["code_refs"] = refs;
+            }
+        }
+        print_line(&v);
     }
     Ok(())
+}
+
+/// Resolve a note's authored code anchors (`code:` / `--code-refs`) against the live
+/// code graph, for the `code_refs` field of a recall row. Each name →
+/// `{name, resolved:true, path, line, signature?}` (its first definition, by
+/// path/line) or `{name, resolved:false}` when nothing matches — and that `false`
+/// is the staleness signal: the documented symbol is gone (or the graph isn't built
+/// yet). `None` when the note documents nothing, so the row stays lean. Resolution
+/// is by NAME (survives line shifts) and includes test-defined symbols (an anchor to
+/// one still "exists").
+fn resolve_code_refs(store: &Store, note_id: &str) -> Result<Option<serde_json::Value>> {
+    let names = store.note_code_refs(note_id)?;
+    if names.is_empty() {
+        return Ok(None);
+    }
+    let mut refs = Vec::with_capacity(names.len());
+    for name in &names {
+        match store.code_symbols_by_name(name, true)?.into_iter().next() {
+            Some(s) => {
+                let mut v = json!({
+                    "name": name,
+                    "resolved": true,
+                    "path": s.path,
+                    "line": s.line,
+                });
+                if let Some(sig) = s.signature.filter(|x| !x.is_empty()) {
+                    v["signature"] = json!(sig);
+                }
+                refs.push(v);
+            }
+            None => refs.push(json!({ "name": name, "resolved": false })),
+        }
+    }
+    Ok(Some(json!(refs)))
 }
 
 // ---- get -----------------------------------------------------------------
@@ -607,6 +669,7 @@ pub fn forget(p: &Parsed, ctx: &Ctx) -> Result<()> {
     }
     let had_row = store.forget(&id)?;
     store.delete_edges_from(&id)?; // drop the note's outgoing graph edges
+    store.delete_note_code_refs(&id)?; // and its code-graph anchors
     store.dangle_edges_to(&id)?; // and re-dangle anyone who linked TO it (B2/B3)
     store.file_state_delete(&format!("notes/{id}.md"))?;
     store.log_op("forget", Some(&id))?;
@@ -791,6 +854,7 @@ fn reindex_notes(store: &Store, emb: Option<&dyn Embedder>, ctx: &Ctx) -> Result
                 &vec,
             )?;
             store.set_note_slug(&id, parsed.slug.as_deref())?;
+            store.set_note_code_refs(&id, &parsed.code_refs)?;
             store.file_state_set(&rel, "note", &id, &hash, mtime_secs(&path))?;
             changed += 1;
             changed_notes.push((id, parsed));

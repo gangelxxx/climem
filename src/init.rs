@@ -1180,6 +1180,16 @@ fn cm_guide(exe: &str) -> String {
          The id names the note's file (`notes/7f3e9a01.md`). Get one back in full with\n\
          `{exe} get 7f3e9a01`; list the newest with `{exe} list`.\n\
          \n\
+         **Anchor a note to the code it documents.** When a note is about specific code,\n\
+         name the symbols with `--code-refs`:\n\
+         ```\n\
+         echo \"Auth issues a JWT; refresh lasts 30 days.\" | {exe} remember --code-refs \"validate_token\"\n\
+         ```\n\
+         On `recall` each anchor is resolved live against the code map: it comes back with its\n\
+         current `path`/`line` (`resolved:true`), or `resolved:false` if that symbol is gone —\n\
+         so the note tells you whether the code it describes still exists. Anchor by NAME\n\
+         (survives line edits), not by line number.\n\
+         \n\
          ## Code map: structural questions about the source\n\
          \n\
          A SEPARATE graph of the code (it never mixes into recall): which symbols exist,\n\
@@ -1392,6 +1402,8 @@ fn entry_point_block(exe_display: &str) -> String {
          A long match comes back as `preview`+`chars` instead of `body`; `{exe} get <id>` for the full text.\n\
          - AFTER a decision worth keeping, save it (the text comes from STDIN, never an arg):\n\
          `echo \"<the fact>\" | {exe} remember` → `{{\"id\":\"0a1b2c3d\"}}`.\n\
+         - Documenting specific code? Anchor the note to it: `… | {exe} remember --code-refs \"sym,sym\"`.\n\
+         `recall` then returns `code_refs` resolved against the code map (`resolved:false` = that symbol is gone).\n\
          - Don't re-read large docs in full — pull the relevant slice via `recall`.\n\n\
          ### CODE MAP — structural questions about the source (beats grep)\n\
          Sources are indexed at `{exe} init`; re-index after edits — `{exe} map <path>`.\n\

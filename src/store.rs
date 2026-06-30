@@ -151,6 +151,21 @@ CREATE TABLE IF NOT EXISTS edges (
 CREATE INDEX IF NOT EXISTS edges_src ON edges(src_id);
 CREATE INDEX IF NOT EXISTS edges_dst ON edges(dst_id);
 
+-- Doc↔code anchors, DERIVED from a note's md `code:` field (wiped on --all,
+-- rebuilt by reindex). Each row is "note documents code-symbol <name>". It is its
+-- OWN table, not an `edges` row, so these anchors never leak into the notes-graph
+-- traversals (`related`/`backlinks`); they're resolved by NAME against code_symbols
+-- live at recall time (a name survives line shifts; a code_symbols.symbol_id would
+-- not). A separate table also means an existing store.db gains it on next open
+-- (CREATE IF NOT EXISTS) with no column migration.
+CREATE TABLE IF NOT EXISTS note_code_refs (
+  note_id TEXT NOT NULL,             -- hex id of the documenting note
+  name    TEXT NOT NULL,             -- referenced code-symbol name (verbatim)
+  PRIMARY KEY (note_id, name)
+);
+CREATE INDEX IF NOT EXISTS note_code_refs_note ON note_code_refs(note_id);
+CREATE INDEX IF NOT EXISTS note_code_refs_name ON note_code_refs(name);
+
 -- ============================================================================
 -- SOURCE-CODE GRAPH (feature `code`) — DELIBERATELY SEPARATE from the notes
 -- graph above. Code lives in its own code_* tables and is queried only through
@@ -375,6 +390,44 @@ impl Store {
             params![id, slug],
         )?;
         Ok(())
+    }
+
+    /// Replace a note's code-graph anchors (the `code:` md field) with `names`.
+    /// Delete-then-insert so the table mirrors the md exactly; reindex calls this
+    /// right after `upsert_note`, `remember` right after the slug. Blank names are
+    /// skipped, duplicates collapse on the (note_id, name) primary key.
+    pub fn set_note_code_refs(&self, id: &str, names: &[String]) -> Result<()> {
+        self.delete_note_code_refs(id)?;
+        for name in names {
+            let name = name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            self.conn.execute(
+                "INSERT OR IGNORE INTO note_code_refs(note_id, name) VALUES(?1, ?2)",
+                params![id, name],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Drop all of a note's code-graph anchors (on `forget`, or before a rewrite).
+    pub fn delete_note_code_refs(&self, id: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM note_code_refs WHERE note_id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// The code-symbol names a note documents (its `code:` anchors), name-sorted for
+    /// a deterministic, byte-stable recall row. Empty when the note documents none.
+    pub fn note_code_refs(&self, id: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name FROM note_code_refs WHERE note_id = ?1 ORDER BY name")?;
+        let rows = stmt
+            .query_map(params![id], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// `(id, slug)` for every note that has a non-empty slug, ordered by id
@@ -1146,7 +1199,7 @@ impl Store {
     pub fn wipe_derived(&self) -> Result<()> {
         self.conn.execute_batch(
             "DELETE FROM notes_fts; DELETE FROM notes; DELETE FROM sync;
-             DELETE FROM imports; DELETE FROM edges;
+             DELETE FROM imports; DELETE FROM edges; DELETE FROM note_code_refs;
              DELETE FROM code_files; DELETE FROM code_symbols; DELETE FROM code_edges;",
         )?;
         Ok(())
@@ -1347,9 +1400,28 @@ mod tests {
         let n = count(
             &s,
             "SELECT count(*) FROM sqlite_master
-             WHERE name IN ('notes','notes_fts','oplog','imports','meta','sync','edges')",
+             WHERE name IN ('notes','notes_fts','oplog','imports','meta','sync','edges','note_code_refs')",
         );
-        assert_eq!(n, 7);
+        assert_eq!(n, 8);
+    }
+
+    #[test]
+    fn note_code_refs_set_get_delete_and_dedup() {
+        let s = mem();
+        let id = s.insert_note("body", "", None, None, "note", &[]).unwrap();
+        s.set_note_code_refs(
+            &id,
+            &["Beta".into(), "Alpha".into(), "Alpha".into(), "  ".into()],
+        )
+        .unwrap();
+        // Name-sorted, deduped (PK collapses the repeat), blanks dropped.
+        assert_eq!(s.note_code_refs(&id).unwrap(), vec!["Alpha", "Beta"]);
+        // Re-set replaces wholesale, so the table always mirrors the md.
+        s.set_note_code_refs(&id, &["Gamma".into()]).unwrap();
+        assert_eq!(s.note_code_refs(&id).unwrap(), vec!["Gamma"]);
+        // Delete clears them.
+        s.delete_note_code_refs(&id).unwrap();
+        assert!(s.note_code_refs(&id).unwrap().is_empty());
     }
 
     #[test]

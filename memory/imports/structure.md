@@ -144,6 +144,16 @@
 перебивает (`commands::parse_budget`: `0`→без обрезки), `--full` = без обрезки. С `--fields`
 бюджет игнорируется (явная проекция). `chars` — известное поле в `RECALL_FIELDS`.
 
+**Doc↔code якоря** (`commands::resolve_code_refs`, 2026-06-30): если у заметки есть код-якоря
+(поле md `code:` → таблица `note_code_refs`, авторятся `remember --code-refs "sym,sym"`), recall в
+дефолтной форме добавляет `code_refs: [{name, resolved, path?, line?, signature?}]`, резолвя каждое
+имя живо через `code_symbols_by_name` (первое опр. по path,line). `resolved:false` = символ исчез
+(сигнал устаревания доки) или граф кода не построен (тогда один nudge в stderr). Якорь по ИМЕНИ
+(переживает сдвиг строк). Своя таблица, НЕ ребро `edges` → не светится в `related`/`backlinks`;
+графы раздельны, recall лишь федерирует read-only резолв. С `--fields` не добавляется. Персист:
+`store::set_note_code_refs`/`note_code_refs`/`delete_note_code_refs`; reindex пересобирает из md
+(рядом с `set_note_slug`), `forget` чистит, `wipe_derived` стирает. См. [decisions.md](decisions.md).
+
 ## Пересборка индекса (`commands::reindex`)
 
 `reindex [--all]` собирает `store.db` из правды (`notes/*.md` + `imports/`). `Store::open`

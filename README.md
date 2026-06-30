@@ -208,7 +208,7 @@ A note's **id is a short hex string** (e.g. `0a1b2c3d`) — and it's also the fi
 |---|---|
 | `cm init [<path>] [--name N] [--docs P1,P2,…] [--provider local\|api] [--model M] [--dimension D] [--endpoint U] [--no-code]` | Scaffold the split layout: `cm` + `config.json` at the **root**, data (`notes/` + `imports/` + `store.db` + `models/`) in a `memory/` subfolder (config's `data_dir` links them). **No args** = do this in the current directory, gather docs (auto-scan + one y/N; root `README`/`CLAUDE`/… are wired, not imported), and map the source tree. `--docs` imports exactly the listed folders/files (no prompt). Won't touch an existing data folder. Path/name override the target (default data folder `memory`). Code map on by default (feature `code`; warns and still scaffolds without it); `--no-code` skips it. Also drops a standalone `CM_GUIDE.md` (full manual the wired pointers link to). Writes a snapshot manifest `memory/.init-manifest.json` (the root `.gitignore` it changed, an `AGENTS.md`/`CM_GUIDE.md` it created, each imported doc's original path) so `deinit` is an **exact rollback**. |
 | `cm deinit <path> [--name N] [--yes]` | **Full rollback of `init`** — leaves only `cm` + `config.json`. Strips the pointer blocks from `CLAUDE.md`/`AGENTS.md`/… (and removes an `AGENTS.md`/`CM_GUIDE.md` init created); **restores every imported doc** to its original path if free, else under `<dir>/climem/<file>` (docs added later via `cm import` go to `docs/climem/`); restores the root `.gitignore` to its pre-init bytes (or deletes it if init created it); removes the data folder (`memory/`) **entirely**. Manifest-driven; with no manifest it falls back to the `imports/` sidecars (restoring by name into `docs/climem/`) and strips only its own `.gitignore` block. Finds the data folder via config's `data_dir` (or `--name`). Asks first; `--yes` skips. |
-| `… \| cm remember [--tags a,b] [--source S] [--slug S] [--relations "p:t,p:t"]` | Write a note. Body from **stdin** → `notes/<id>.md`, then index. `--slug`/`--relations` feed the graph. Prints `{"id":"<hex>"}`. |
+| `… \| cm remember [--tags a,b] [--source S] [--slug S] [--relations "p:t,p:t"] [--code-refs "sym,sym"]` | Write a note. Body from **stdin** → `notes/<id>.md`, then index. `--slug`/`--relations` feed the notes graph; `--code-refs` anchors the note to code symbols (resolved live at `recall`). Prints `{"id":"<hex>"}`. |
 | `… \| cm feedback [--tags a,b]` · `cm feedback --list [--recent N]` | Let the agent that *uses* cm report what's missing or could be better. Body from **stdin** (like `remember`) → an ordinary note tagged `cm-feedback`, stamped with the cm version, saved into **this project's** memory; prints `{"id":"<hex>"}`. `--list` prints the feedback gathered so far (newest first). Review anytime with `cm feedback --list` or `cm recall "<topic>" --tag cm-feedback`. |
 | `cm recall "<query>" [--limit N] [--budget C \| --full] [--explain] [--fields …] [--tag T] [--origin-prefix F] [--min-score X] [--related <id>]` | Hybrid search (FTS5 + vector, plus optional graph proximity via `--related <id>`, fused via RRF). Returns lean JSONL sorted by relevance, **preview-first**: a long body comes back as `preview`+`chars` (cap `search.recall_body_chars`, default 500) unless `--full`/`--budget 0`. `--related` is off unless `search.hybrid_weights.graph` is non-zero. |
 | `cm get <id>` | Fetch one record in full. |
@@ -343,6 +343,29 @@ Needs a binary built with the feature (`cargo build --release --features code`);
 the memory folder, gathers docs, *and* maps the source tree in one go (the counts come back as
 `{"code":{"files","symbols","edges"}}` in init's output). The code map is on by default; pass
 `--no-code` for a docs-only setup. Without the feature, init warns and still scaffolds normally.
+
+### Doc ↔ code anchors (a note that knows whether its code still exists)
+
+A note can anchor itself to the code it documents. Author the symbol names with
+`cm remember --code-refs "validate_token, JwtAuth"` (stored as a `code:` field in the note's md).
+They're not searched as text — they're **anchors by name** into the code graph, resolved **live at
+`recall`**:
+
+```bash
+echo "Auth issues a JWT; refresh lasts 30 days." | cm remember --code-refs "validate_token"
+cm recall "how does auth work"
+# → {"id":"…","kind":"note","body":"Auth issues a JWT…",
+#    "code_refs":[{"name":"validate_token","resolved":true,"path":"src/auth.rs","line":42,
+#                  "signature":"fn validate_token("}]}
+```
+
+When the symbol still exists you get its **current** `path`/`line`/`signature`; when it's gone the
+anchor comes back `"resolved":false` — a built-in **staleness signal** telling you the doc now
+describes code that no longer exists. Anchored by name (not `path:line`), so ordinary edits that
+shift lines don't break it. The notes graph and the code graph stay separate stores — `recall` just
+federates the lookup; nothing is mixed or duplicated. (Anchors resolve against whatever `cm map`
+last indexed; in a store with no code graph they read `resolved:false` with a one-line hint to run
+`cm map`.)
 
 ---
 

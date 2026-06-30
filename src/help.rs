@@ -165,12 +165,19 @@ COMMANDS (full reference)
   --------
     echo "<your text>" | cm remember [--tags a,b,c] [--source <s>]
                                      [--slug <name>] [--relations "p:t, p:t"]
+                                     [--code-refs "sym, sym"]
     Writes the note to notes/<id>.md, then indexes it for search.
     --tags a,b,c   comma-separated labels you can later filter on.
     --source <s>   where the fact came from (free text), kept with the note.
     --slug <name>  a human name OTHER notes can link to instead of the hex id.
     --relations    graph links, as "predicate:target, predicate:target".
                    The target is a slug, or id:<hex> to point at an exact id.
+    --code-refs    names of source-code symbols this note documents, comma-
+                   separated (e.g. "validate_token, JwtAuth"). They anchor the note
+                   to the code graph: `recall` resolves each against `cm map` and
+                   returns it with its live path/line, or flags it resolved:false
+                   when the symbol is gone — so a doc can show whether its code still
+                   exists. Anchored by NAME, so it survives line edits.
     Inside the text you may write [[name]] to link to another note (name is its
     slug, or id:<hex>).
     PRINTS:  {"id":"<hex>"}   <- save this id; it names the note's file.
@@ -232,6 +239,9 @@ COMMANDS (full reference)
     {"id","kind","preview","chars"} when the body is over budget; plus
     tags/origin/source when the note has them. Empty fields are omitted to save
     space. When you see "preview"+"chars", `cm get <id>` returns the full body.
+    If a note has code anchors (see `remember --code-refs`), the row also carries
+    "code_refs": [{"name","resolved",...}] — each resolved one adds its live
+    "path"/"line"; "resolved":false means that documented symbol is gone (stale).
     Example:  cm recall "how does authentication work" --limit 5
 
   get  — fetch ONE note in full, by id.
