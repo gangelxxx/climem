@@ -304,9 +304,11 @@ COMMANDS (full reference)
     RENAMED/moved memory folder); store.db is present and opens (catches a DELETED
     index); the hand-kept notes<->search-index sync; embedder signature/dimension
     drift (vectors that no longer compare); store-vs-disk drift (a note in the index
-    with no notes/<id>.md, or an unindexed file); slug collisions; the code graph; and
-    that the agent instruction files (CLAUDE.md/AGENTS.md/…) carry a current pointer to
-    a cm binary that actually EXISTS at the project root.
+    with no notes/<id>.md, or an unindexed file); slug collisions; the code graph; note
+    text corrupted by a non-UTF-8 shell (non-ASCII lost to '?' before cm saw it — this
+    is report-only, the loss is irreversible); and that the agent instruction files
+    (CLAUDE.md/AGENTS.md/…) carry a current pointer to a cm binary that actually EXISTS
+    at the project root.
     --fix applies ONLY the safe, idempotent repairs, by delegating to existing
     commands: it creates any missing data dirs and rebuilds the index with `reindex`
     (or `reindex --all` when an embedder change means everything must be re-embedded),

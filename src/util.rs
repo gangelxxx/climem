@@ -117,6 +117,32 @@ pub fn mtime_secs(path: &Path) -> i64 {
         .unwrap_or(0)
 }
 
+/// Number of maximal runs of `?` of length >= `min_len` in `s`. A PURE-ASCII string
+/// carrying such runs is the tell-tale of a shell that replaced non-ASCII text (e.g.
+/// Cyrillic) with `?` before it ever reached us — Windows PowerShell's default
+/// `$OutputEncoding` does exactly this when piping into `cm remember`. Used to flag it
+/// after the fact (`cm doctor`'s note_encoding check) and to warn at save time. The
+/// loss is irreversible (the original bytes are gone), so we only ever detect/warn.
+/// Returns 0 for `min_len == 0`.
+pub fn qmark_runs(s: &str, min_len: usize) -> usize {
+    if min_len == 0 {
+        return 0;
+    }
+    let mut runs = 0;
+    let mut cur = 0usize;
+    for c in s.chars() {
+        if c == '?' {
+            cur += 1;
+            if cur == min_len {
+                runs += 1; // count each run once, when it first reaches min_len
+            }
+        } else {
+            cur = 0;
+        }
+    }
+    runs
+}
+
 /// A short, single-line preview of a note body for `list`-style output.
 pub fn preview(text: &str, max_chars: usize) -> String {
     let one_line: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -183,6 +209,19 @@ mod tests {
     fn preview_zero_max_chars_boundary() {
         assert_eq!(preview("x", 0), "…");
         assert_eq!(preview("", 0), "");
+    }
+
+    #[test]
+    fn qmark_runs_counts_only_long_runs() {
+        // No runs of length >= 4.
+        assert_eq!(qmark_runs("what??? ok? sure?", 4), 0);
+        // Two separate runs >= 4 (a shell-mangled Cyrillic line).
+        assert_eq!(qmark_runs("?????? ?????? (2026): ?? actions", 4), 2);
+        // A single long run counts once, regardless of length.
+        assert_eq!(qmark_runs("a????????b", 4), 1);
+        // Degenerate min_len.
+        assert_eq!(qmark_runs("????", 0), 0);
+        assert_eq!(qmark_runs("", 4), 0);
     }
 
     #[test]

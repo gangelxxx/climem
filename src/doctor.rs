@@ -8,7 +8,8 @@
 //! rebuildable from the md truth) and a renamed/moved data folder (config's
 //! `data_dir` no longer resolves). It also surfaces the store invariants SQLite
 //! doesn't enforce for us — the hand-maintained `notes`↔`notes_fts` sync, embedder
-//! signature/dimension drift, store↔disk drift, and dangling-vs-resolved edges.
+//! signature/dimension drift, store↔disk drift, dangling-vs-resolved edges, and text
+//! corrupted by a non-UTF-8 shell (non-ASCII lost to `?` before cm saw stdin).
 //!
 //! Conventions honored (conventions.md): data is JSONL on stdout (`print_line`),
 //! narration/warnings on stderr; it reads NOTHING from stdin; it is read-only except
@@ -928,6 +929,35 @@ fn store_checks(
         }
     }
 
+    // --- text encoding: notes/imports whose non-ASCII text was lost to `?` ---
+    //     The shell-encoding bug (PowerShell's default $OutputEncoding) replaces every
+    //     non-ASCII char with `?` BEFORE cm ever sees stdin, so the loss is irreversible
+    //     — report-only (rewrite the note, or `cm forget <id>`), never auto-fixed. The
+    //     `remember` save-time guard (commands::warn_if_shell_mangled) flags it earlier.
+    let mut corrupt: Vec<String> = Vec::new();
+    collect_corrupt(&ctx.notes_dir, true, "notes", &mut corrupt);
+    collect_corrupt(&ctx.imports_dir, false, "imports", &mut corrupt);
+    if corrupt.is_empty() {
+        f.push(ok("note_encoding"));
+    } else {
+        f.push(finding(
+            "note_encoding",
+            Status::Warn,
+            format!(
+                "{} file(s) with lost non-ASCII text (literal '?' runs / U+FFFD): {}",
+                corrupt.len(),
+                sample(&corrupt)
+            ),
+            false,
+            Some(
+                "text lost before cm saw it (non-UTF-8 stdin) — rewrite the note, or \
+                 `cm forget <id>`; set the shell to UTF-8 to prevent it \
+                 (PowerShell: $OutputEncoding=[Text.UTF8Encoding]::new(); cmd: chcp 65001)"
+                    .into(),
+            ),
+        ));
+    }
+
     // --- code graph consistency (report only; `cm map` re-maps, --fix won't) ---
     if cf > 0 || cs > 0 || ce > 0 {
         let dangling_code = store
@@ -1011,6 +1041,49 @@ fn is_md(p: &Path) -> bool {
         .and_then(|x| x.to_str())
         .map(|x| x.eq_ignore_ascii_case("md") || x.eq_ignore_ascii_case("markdown"))
         .unwrap_or(false)
+}
+
+/// Why a file's text reads as corrupted by a lossy encoding event, or `None` if clean:
+/// it isn't valid UTF-8, it carries U+FFFD replacement chars, or it has runs of `?`
+/// (>= 4) — the signature of a shell that replaced non-ASCII before cm saw the text.
+fn corrupt_reason(path: &Path) -> Option<&'static str> {
+    match std::fs::read_to_string(path) {
+        Err(_) => Some("invalid UTF-8"),
+        Ok(s) => {
+            if s.contains('\u{FFFD}') {
+                Some("replacement chars (decode error)")
+            } else if crate::util::qmark_runs(&s, 4) > 0 {
+                Some("'?'-runs (lost non-ASCII)")
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Collect display names of corrupted files under `dir` (md-only for notes/, all
+/// non-sidecar files for imports/), prefixed for the report (e.g. `notes/<id>.md`).
+fn collect_corrupt(dir: &Path, md_only: bool, prefix: &str, out: &mut Vec<String>) {
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if !p.is_file() {
+                continue;
+            }
+            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if md_only && !is_md(&p) {
+                continue;
+            }
+            if !md_only && name.ends_with(".meta.json") {
+                continue;
+            }
+            if corrupt_reason(&p).is_some() {
+                out.push(format!("{prefix}/{name}"));
+            }
+        }
+    }
 }
 
 /// `notes/<id>.md` files whose `<id>` has no row in the store (un-indexed note files).
@@ -1239,6 +1312,32 @@ mod tests {
             c.tally(f);
         }
         assert!(summary_text(&c, 0, false).contains("all checks passed"));
+    }
+
+    #[test]
+    fn note_encoding_flags_shell_mangled_files() {
+        let tmp = TempDir::new().unwrap();
+        healthy(tmp.path());
+        let notes = tmp.path().join("memory").join("notes");
+        std::fs::write(
+            notes.join("aaaa1111.md"),
+            "---\nid: aaaa1111\n---\nnormal ascii body",
+        )
+        .unwrap();
+        // A note whose Cyrillic was lost to '?' (runs of >= 4).
+        std::fs::write(
+            notes.join("bbbb2222.md"),
+            "---\nid: bbbb2222\n---\n?????? ?????? lost text",
+        )
+        .unwrap();
+        let ctx = Ctx::new(tmp.path());
+        let r = diagnose(&ctx, tmp.path());
+        let ne = check(&r, "note_encoding");
+        assert_eq!(ne.status, Status::Warn);
+        assert!(!ne.fixable, "encoding loss is unrecoverable → report-only");
+        let d = ne.detail.as_ref().unwrap();
+        assert!(d.contains("bbbb2222"), "{d}");
+        assert!(!d.contains("aaaa1111"), "{d}");
     }
 
     #[test]

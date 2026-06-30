@@ -101,7 +101,27 @@ fn read_stdin() -> Result<String> {
     std::io::stdin().read_to_string(&mut s)?;
     // Drop any UTF-8 BOMs (EF BB BF) that PowerShell 5.1 on Windows likes to add.
     // PS 5.1 can emit two of them: one from the $OutputEncoding preamble, one per object.
-    Ok(s.trim_start_matches('\u{feff}').to_string())
+    let s = s.trim_start_matches('\u{feff}').to_string();
+    warn_if_shell_mangled(&s);
+    Ok(s)
+}
+
+/// Warn (best-effort, stderr) when a stdin body looks SHELL-MANGLED: pure ASCII with
+/// runs of `?`, the signature of a terminal that replaced non-ASCII (Cyrillic/Unicode)
+/// with `?` before the text reached us — Windows PowerShell's default `$OutputEncoding`
+/// does this when piping into `cm remember`. The note is still saved (the loss already
+/// happened upstream, irreversibly), but we nudge the user to switch to UTF-8 so it
+/// won't recur. `cm doctor`'s `note_encoding` check finds notes already saved this way.
+fn warn_if_shell_mangled(body: &str) {
+    if body.is_ascii() && crate::util::qmark_runs(body, 4) > 0 {
+        eprintln!(
+            "warning: the text looks shell-mangled — runs of '?' with no non-ASCII chars, \
+             as if the terminal replaced Unicode before cm saw it. The note is saved, but \
+             those lost characters can't be recovered. Switch the shell to UTF-8 to prevent \
+             it (PowerShell: $OutputEncoding=[Text.UTF8Encoding]::new(); cmd: chcp 65001), \
+             then re-enter the text."
+        );
+    }
 }
 
 /// Print a non-fatal warning if the embedder we're using now isn't the one the
