@@ -170,9 +170,12 @@ CREATE INDEX IF NOT EXISTS note_code_refs_name ON note_code_refs(name);
 -- SOURCE-CODE GRAPH (feature `code`) — DELIBERATELY SEPARATE from the notes
 -- graph above. Code lives in its own code_* tables and is queried only through
 -- `cm map`; it never mixes into notes/notes_fts/edges, so `recall`/`related`
--- stay byte-identical. All three tables are pure derived cache over the live
--- working tree (the source files themselves are the truth; nothing is copied
--- into the memory folder), so they wipe+rebuild from disk like the rest.
+-- stay byte-identical. All three tables are a pure derived cache over the live
+-- working tree (the source files themselves are the truth; nothing is copied into
+-- the memory folder). They are owned by `cm map` alone — rebuilt incrementally by
+-- content hash, gone files pruned, stale queries self-healed — and are NOT touched
+-- by `reindex`/`wipe_derived` (which rebuild only the notes/imports index from md;
+-- wiping the code graph there would empty it until the next `cm map`).
 -- ============================================================================
 
 -- One row per indexed source file. content_hash drives incremental `cm map`
@@ -1202,18 +1205,22 @@ impl Store {
 
     // ---- derived-wipe (reindex --all) ------------------------------------
 
-    /// Wipe the purely-derived tables (notes, notes_fts, sync, imports, edges, and
-    /// the code_* graph) for a full rebuild. Everything in here can be reconstructed
-    /// from the files: notes/*.md (plus their frontmatter relations and body
-    /// `[[links]]`), the imports/ originals with their `.meta.json` sidecars, and —
-    /// for the code graph — the source tree on disk. We deliberately leave `oplog`
-    /// (operation history) and `meta` (the embedder signature) alone, since those
-    /// can't be.
+    /// Wipe the tables `reindex --all` rebuilds from the **notes/imports** source of
+    /// truth: notes/*.md (with their frontmatter relations, body `[[links]]`, and
+    /// `code:` anchors) and the imports/ originals with their `.meta.json` sidecars.
+    /// That's notes, notes_fts, sync, imports, edges, and note_code_refs.
+    ///
+    /// The **code graph** (`code_files`/`code_symbols`/`code_edges`) is deliberately
+    /// NOT touched: it's derived from the *source tree*, not from md, so `reindex`
+    /// never rebuilds it — only `cm map` does (incrementally, pruning gone files, and
+    /// self-healing on a stale query). Wiping it here would leave the graph empty
+    /// until the next `cm map`, silently breaking `map` queries and doc↔code anchor
+    /// resolution after a routine `reindex --all`. `oplog` (history) and `meta` (the
+    /// embedder signature) are also left alone — they aren't derivable from files.
     pub fn wipe_derived(&self) -> Result<()> {
         self.conn.execute_batch(
             "DELETE FROM notes_fts; DELETE FROM notes; DELETE FROM sync;
-             DELETE FROM imports; DELETE FROM edges; DELETE FROM note_code_refs;
-             DELETE FROM code_files; DELETE FROM code_symbols; DELETE FROM code_edges;",
+             DELETE FROM imports; DELETE FROM edges; DELETE FROM note_code_refs;",
         )?;
         Ok(())
     }
@@ -1780,16 +1787,26 @@ mod tests {
             .unwrap();
         s.insert_edge("a", "links_to", Some("b"), "b", "wikilink")
             .unwrap();
+        s.set_note_code_refs("a", &["Sym".into()]).unwrap();
+        // A code-graph row, derived from the SOURCE TREE (not md) — must survive.
+        s.upsert_code_file("lib.rs", "rust", "h", 0).unwrap();
+        s.insert_code_symbol("s1", "lib.rs", "Sym", "struct", 1, None, false)
+            .unwrap();
 
         s.wipe_derived().unwrap();
 
-        // All derived tables emptied (notes/imports rebuild from files+sidecars)...
+        // Tables rebuilt from notes/imports md are emptied...
         assert_eq!(count(&s, "SELECT count(*) FROM notes"), 0);
         assert_eq!(count(&s, "SELECT count(*) FROM notes_fts"), 0);
         assert_eq!(count(&s, "SELECT count(*) FROM sync"), 0);
         assert_eq!(count(&s, "SELECT count(*) FROM imports"), 0);
         assert_eq!(count(&s, "SELECT count(*) FROM edges"), 0);
-        // ...but operation history and the embedder signature survive (not derivable).
+        // ...including note_code_refs (the `code:` anchors are rebuilt from md)...
+        assert_eq!(count(&s, "SELECT count(*) FROM note_code_refs"), 0);
+        // ...but the CODE GRAPH survives — reindex doesn't own it, `cm map` does.
+        assert_eq!(count(&s, "SELECT count(*) FROM code_symbols"), 1);
+        assert_eq!(count(&s, "SELECT count(*) FROM code_files"), 1);
+        // ...and operation history and the embedder signature survive (not derivable).
         assert_eq!(count(&s, "SELECT count(*) FROM oplog"), 1);
         assert_eq!(
             s.meta_get("embedder_signature").unwrap().as_deref(),
