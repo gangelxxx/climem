@@ -1084,10 +1084,21 @@ fn collect_code_query(
         for s in filter_kind(store.code_symbols_in_like(&key, tests)?, kind) {
             out.push(code_symbol_value(&s));
         }
-    } else {
-        // `--list` with no value = whole graph; an optional `--kind` narrows it.
+    } else if p.has("all") {
+        // `--list --all`: the whole table of contents, ordered by path/line. The
+        // escape hatch when you genuinely want every symbol, not just the hubs.
         for s in store.code_list(kind, tests)? {
             out.push(code_symbol_value(&s));
+        }
+    } else {
+        // `--list` (default): god-node view — symbols ranked by graph degree (how
+        // connected they are in the `uses` graph), capped to the top N (default 30).
+        // The hubs are the architecture's skeleton, so this is the slice an agent
+        // should read first, at a fraction of a full dump's tokens. `--all` lifts the
+        // cap; `--limit N` resizes it; `--kind`/`--tests` narrow either.
+        let limit = parse_limit(p.value("limit"), 30)?;
+        for (s, degree) in store.code_hubs(kind, tests, Some(limit))? {
+            out.push(code_hub_value(&s, degree));
         }
     }
     Ok(out)
@@ -1441,6 +1452,15 @@ fn code_symbol_value(s: &crate::store::CodeSymbolRow) -> serde_json::Value {
             v["signature"] = json!(sig);
         }
     }
+    v
+}
+
+/// `code_symbol_value` plus the `degree` that ranked this symbol into the `map
+/// --list` god-node view — so the ranking is transparent (the agent sees *why* a
+/// symbol is a hub, not just that it floated to the top).
+fn code_hub_value(s: &crate::store::CodeSymbolRow, degree: i64) -> serde_json::Value {
+    let mut v = code_symbol_value(s);
+    v["degree"] = json!(degree);
     v
 }
 

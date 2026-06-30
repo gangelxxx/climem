@@ -1028,6 +1028,56 @@ impl Store {
         Ok(rows)
     }
 
+    /// God-node ranking for `cm map --list` (token-efficiency, borrowed from
+    /// graphify's degree-centrality "god nodes"): symbol definitions ordered by their
+    /// connectivity in the `uses` graph — in-degree (how many symbols reference it)
+    /// plus resolved out-degree (how many in-project symbols it references). The
+    /// high-degree symbols are the hubs to read first to grasp an architecture, so a
+    /// capped top-N is a tiny slice that still covers the skeleton. `limit = None`
+    /// returns the whole ranking (the `--all` escape hatch). Same `kind`/`is_test`
+    /// filters as `code_list`; ties break on a stable path/line for determinism.
+    pub fn code_hubs(
+        &self,
+        kind: Option<&str>,
+        include_tests: bool,
+        limit: Option<usize>,
+    ) -> Result<Vec<(CodeSymbolRow, i64)>> {
+        let mut sql = String::from(
+            "SELECT s.symbol_id, s.path, s.name, s.kind, s.line, s.signature, s.is_test,
+                    (SELECT count(*) FROM code_edges e
+                       WHERE e.predicate = 'uses' AND e.dst = s.symbol_id)
+                  + (SELECT count(*) FROM code_edges e
+                       WHERE e.predicate = 'uses' AND e.src = s.symbol_id AND e.dst IS NOT NULL)
+                    AS degree
+             FROM code_symbols s",
+        );
+        if kind.is_some() {
+            sql.push_str(" WHERE s.kind = ?1");
+            if !include_tests {
+                sql.push_str(" AND s.is_test = 0");
+            }
+        } else if !include_tests {
+            sql.push_str(" WHERE s.is_test = 0");
+        }
+        sql.push_str(" ORDER BY degree DESC, s.path, s.line");
+        if let Some(n) = limit {
+            // `n` is a usize from our own parse, never user SQL text — no injection.
+            sql.push_str(&format!(" LIMIT {n}"));
+        }
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let map_row = |r: &rusqlite::Row<'_>| Ok((map_code_symbol(r)?, r.get::<_, i64>(7)?));
+        let rows = match kind {
+            Some(k) => stmt
+                .query_map(params![k], map_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            None => stmt
+                .query_map([], map_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        };
+        Ok(rows)
+    }
+
     /// Callers of a symbol: the defining symbol rows on the `src` end of every
     /// resolved `uses` edge whose target is one of `name`'s definitions
     /// (for `cm map --uses <name>`). Returns each calling symbol with the line.
@@ -1982,6 +2032,45 @@ mod tests {
             .map(|r| r.name)
             .collect();
         assert_eq!(classes, vec!["Config"]); // only the struct/class kind
+    }
+
+    #[test]
+    fn code_hubs_ranks_by_degree_and_caps() {
+        let s = mem();
+        seed_code_graph(&s);
+        // Degrees over the `uses` graph (resolved only): parse out=1 (->helper),
+        // helper in=1 (<-parse), Config 0. Ties (parse/helper at 1) break on path,line
+        // -> parse (line 1) before helper (line 5); Config (0) last.
+        let ranked: Vec<(String, i64)> = s
+            .code_hubs(None, false, None)
+            .unwrap()
+            .into_iter()
+            .map(|(r, d)| (r.name, d))
+            .collect();
+        assert_eq!(
+            ranked,
+            vec![
+                ("parse".to_string(), 1),
+                ("helper".to_string(), 1),
+                ("Config".to_string(), 0),
+            ]
+        );
+        // The cap keeps only the top-N hubs.
+        let top1: Vec<String> = s
+            .code_hubs(None, false, Some(1))
+            .unwrap()
+            .into_iter()
+            .map(|(r, _)| r.name)
+            .collect();
+        assert_eq!(top1, vec!["parse"]);
+        // Same kind / test filters as code_list: functions only, no test symbols.
+        let funcs: Vec<String> = s
+            .code_hubs(Some("function"), false, None)
+            .unwrap()
+            .into_iter()
+            .map(|(r, _)| r.name)
+            .collect();
+        assert_eq!(funcs, vec!["parse", "helper"]); // Config (class) and parse_works (test) excluded
     }
 
     #[test]

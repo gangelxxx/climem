@@ -216,13 +216,18 @@
 - **Запросы** (read-only, работают и без фичи — граф уже в БД): `--query <name>`
   (`code_symbols_by_name` → где определён, точное имя), `--like <substr>`
   (`code_symbols_like` → символы по подстроке имени, ESCAPE для `%`/`_`), `--list`
-  (`code_list` → оглавление всех символов), `--uses <name>` (`code_callers_of` → кто
+  (**god-node-вью, заимствование из graphify, 2026-06-30**: `code_hubs` ранжирует символы по
+  степени в графе `uses` — входящие `dst=id` + резолвнутые исходящие `src=id,dst NOT NULL` —
+  и отдаёт топ-30 хабов с полем `degree`; «скелет архитектуры». `--limit N` меняет потолок,
+  `--all` → полный список без ранжирования через старый `code_list`; токен-экономия ~12× на
+  реальном дереве climem: 30 vs 367), `--uses <name>` (`code_callers_of` → кто
   использует, с охватывающим символом и строкой), `--calls <name>` (`code_callees_of` →
   от чего зависит/исходящие вызовы; **по умолчанию resolved-only** — прячет stdlib-шум
   `map`/`unwrap`/…, ~3/4 рёбер; `--external` показывает всё), `--defines <file>`
   (`code_symbols_in_like`, путь нестрого: `code.rs`≡`src/code.rs`). Общий фильтр `--kind`
   (`commands::filter_kind`) сужает листинги по виду символа (function/method/class/…).
-  Вывод JSONL `{name,kind,path,line,signature?}` / `{name,kind,path,line,def_line}` (uses) /
+  Вывод JSONL `{name,kind,path,line,signature?}` / `{...,degree}` (`--list`, `code_hub_value`) /
+  `{name,kind,path,line,def_line}` (uses) /
   `{calls,line,resolved}` (calls). **Резолв `uses`/`calls` — по имени, без областей:**
   одноимённые символы сливаются, возможен ложный хит (задокументировано в help).
 - **Самозалечивание устаревшего графа (2026-06-23).** Все запросы идут через

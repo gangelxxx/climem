@@ -1198,6 +1198,7 @@ fn cm_guide(exe: &str) -> String {
          | What does file F define? | `{exe} map --defines F` | `name, kind, path, line, signature` |\n\
          | Who calls / uses X? | `{exe} map --uses X` | `name, kind, path, line, def_line` |\n\
          | What does X depend on? | `{exe} map --calls X` | `calls, line, resolved` |\n\
+         | What are the key symbols? | `{exe} map --list` | `name, kind, path, line, signature, degree` |\n\
          \n\
          Worked examples with real output:\n\
          ```\n\
@@ -1210,8 +1211,10 @@ fn cm_guide(exe: &str) -> String {
          {exe} map --calls recall_with       # its in-project dependencies\n\
          → {{\"calls\":\"fts_search\",\"line\":196,\"resolved\":true}}\n\
          ```\n\
-         For symbol listings, `--kind function|method|class|…` narrows by kind, and\n\
-         `--tests` opts test code back in (hidden by default).\n\
+         `{exe} map --list` ranks symbols by how connected they are (`degree`) and shows\n\
+         the top 30 hubs — the architecture skeleton; `--all` lists every symbol, `--limit N`\n\
+         resizes the cap. For symbol listings, `--kind function|method|class|…` narrows by\n\
+         kind, and `--tests` opts test code back in (hidden by default).\n\
          \n\
          **When to use grep instead:** free text (a string, an error message, a TODO, a\n\
          config key); very common/overloaded names (`new`, `get`, `run` — the map merges\n\
@@ -1403,6 +1406,7 @@ fn entry_point_block(exe_display: &str) -> String {
          - `{exe} map --defines <file>` a file's API   → `{{name,kind,path,line,signature}}`\n\
          - `{exe} map --uses <name>`    who calls it   → `{{name,kind,path,line,def_line}}`\n\
          - `{exe} map --calls <name>`   what it uses   → `{{calls,line,resolved}}`\n\
+         - `{exe} map --list`           top hub symbols → `{{name,kind,path,line,signature,degree}}` (--all = every symbol)\n\
          Reliable for unique names; for common names (new/get/run), arbitrary text, or\n\
          just-edited code — use grep instead.\n\n\
          ### FEEDBACK — help make `{exe}` better\n\

@@ -34,7 +34,7 @@ WHICH COMMAND DO I USE? (pick by what you want to do)
   Index source code into a dependency graph ...... map <path>
   Where is symbol X defined? ..................... map --query <name>
   Find symbols by partial name ................... map --like <substr>
-  List all symbols (a table of contents) ......... map --list [--kind K]
+  Top hub symbols (the architecture skeleton) .... map --list   (--all = every symbol)
   Who uses symbol X? ............................. map --uses <name>
   What does symbol X depend on? .................. map --calls <name>
   What does file F define? ....................... map --defines <file>
@@ -364,8 +364,11 @@ COMMANDS (full reference)
         -> one line per definition: {"name","kind","path","line","signature"}.
       cm map --like <substr>    symbols whose NAME contains <substr> (the structural
         "show me everything called *config*"). Same output shape as --query.
-      cm map --list             every symbol (a table of contents). Add --kind to
-        narrow, e.g. list all the types. Same output shape as --query.
+      cm map --list             the graph's HUB symbols — ranked by how connected
+        they are (`degree`), capped to the top 30. This is the architecture's
+        skeleton: read these first. -> {"name","kind","path","line","signature",
+        "degree"}. --limit N resizes the cap; --all lists EVERY symbol (a full table
+        of contents, no ranking); --kind narrows (e.g. list the top types).
       cm map --uses <name>      which symbols USE this one (its callers).
         -> {"name","kind","path","line","def_line"}  (line = the use site).
       cm map --calls <name>     what this symbol DEPENDS ON (its outgoing calls).
@@ -382,7 +385,8 @@ COMMANDS (full reference)
       cm map ./src --lang rust
       cm map --query upsert_note
       cm map --like code --kind function
-      cm map --list --kind class      (--tests to include test code)
+      cm map --list                   (top 30 hub symbols, most-connected first)
+      cm map --list --all --kind class   (every type; --tests to include test code)
       cm map --uses Store
       cm map --calls reindex_notes
 
