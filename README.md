@@ -214,7 +214,7 @@ A note's **id is a short hex string** (e.g. `0a1b2c3d`) — and it's also the fi
 | `cm get <id>` | Fetch one record in full. |
 | `cm list [--recent N]` | List the most recent records (body shown as a preview). |
 | `cm related <id> [--depth D] [--predicate P] [--limit N] [--fields …]` | Graph neighbours this note points at (frontmatter `relations` + `[[wikilinks]]`). Dangling targets come back as `{"dangling":true,…}`. |
-| `cm backlinks <id> [--predicate P] [--limit N]` | The reverse of `related`: notes that point **at** `<id>` → `{"id","kind","predicate","preview"}`. |
+| `cm backlinks <id> [--predicate P] [--limit N]` · `cm backlinks --symbol <name> [--limit N]` | The reverse of `related`: notes that point **at** `<id>` → `{"id","kind","predicate","preview"}`. With `--symbol`, the doc↔code mirror: notes that **document** a code symbol → `{"id","kind","documents","preview"}`. |
 | `cm forget <id>` | Delete `notes/<id>.md` and its index row → `{"deleted":bool,"id":"<hex>"}`. (Imported chunks can't be deleted this way — edit `imports/` and `reindex`.) |
 | `cm import <file> [--tags a,b]` | Copy the original into `imports/`, split it into chunks, index them → `{"imported":"…","chunks":N}`. |
 | `cm reindex [--all]` | Rebuild `store.db` from `notes/` + `imports/`, incrementally (by content hash). `--all` forces a full re-embed → `{"indexed":N,"changed":M}`. |
@@ -347,9 +347,9 @@ the memory folder, gathers docs, *and* maps the source tree in one go (the count
 ### Doc ↔ code anchors (a note that knows whether its code still exists)
 
 A note can anchor itself to the code it documents. Author the symbol names with
-`cm remember --code-refs "validate_token, JwtAuth"` (stored as a `code:` field in the note's md).
-They're not searched as text — they're **anchors by name** into the code graph, resolved **live at
-`recall`**:
+`cm remember --code-refs "validate_token, JwtAuth"`, or inline in the body as
+`[[code:validate_token]]` (either way they're stored as the note's `code:` field). They're not
+searched as text — they're **anchors by name** into the code graph, resolved **live at `recall`**:
 
 ```bash
 echo "Auth issues a JWT; refresh lasts 30 days." | cm remember --code-refs "validate_token"
@@ -366,6 +366,10 @@ shift lines don't break it. The notes graph and the code graph stay separate sto
 federates the lookup; nothing is mixed or duplicated. (Anchors resolve against whatever `cm map`
 last indexed; in a store with no code graph they read `resolved:false` with a one-line hint to run
 `cm map`.)
+
+The mirror direction — *from a symbol, find the docs that explain it* — is `cm backlinks --symbol
+validate_token`, which lists the notes that document that symbol. So the link reads both ways: a
+note knows the code it covers, and a symbol knows the notes that cover it.
 
 ---
 

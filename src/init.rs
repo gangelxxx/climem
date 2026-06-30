@@ -1185,10 +1185,12 @@ fn cm_guide(exe: &str) -> String {
          ```\n\
          echo \"Auth issues a JWT; refresh lasts 30 days.\" | {exe} remember --code-refs \"validate_token\"\n\
          ```\n\
+         (or inline in the body: `… see [[code:validate_token]] …` — same effect).\n\
          On `recall` each anchor is resolved live against the code map: it comes back with its\n\
          current `path`/`line` (`resolved:true`), or `resolved:false` if that symbol is gone —\n\
          so the note tells you whether the code it describes still exists. Anchor by NAME\n\
-         (survives line edits), not by line number.\n\
+         (survives line edits), not by line number. The mirror direction — which notes document\n\
+         a symbol — is `{exe} backlinks --symbol <name>`.\n\
          \n\
          ## Code map: structural questions about the source\n\
          \n\

@@ -430,6 +430,19 @@ impl Store {
         Ok(rows)
     }
 
+    /// The ids of every note that documents the code symbol `name` (the reverse of
+    /// `note_code_refs`, for `cm backlinks --symbol <name>` — "which docs cover this
+    /// symbol"). Id-sorted for a deterministic result.
+    pub fn notes_documenting(&self, name: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT note_id FROM note_code_refs WHERE name = ?1 ORDER BY note_id")?;
+        let rows = stmt
+            .query_map(params![name], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// `(id, slug)` for every note that has a non-empty slug, ordered by id
     /// ascending so a duplicate slug resolves to the lowest id (see
     /// `graph::build_slug_map`).
@@ -1416,10 +1429,14 @@ mod tests {
         .unwrap();
         // Name-sorted, deduped (PK collapses the repeat), blanks dropped.
         assert_eq!(s.note_code_refs(&id).unwrap(), vec!["Alpha", "Beta"]);
+        // Reverse lookup: which notes document a symbol (backlinks --symbol).
+        assert_eq!(s.notes_documenting("Alpha").unwrap(), vec![id.clone()]);
+        assert!(s.notes_documenting("Nonexistent").unwrap().is_empty());
         // Re-set replaces wholesale, so the table always mirrors the md.
         s.set_note_code_refs(&id, &["Gamma".into()]).unwrap();
         assert_eq!(s.note_code_refs(&id).unwrap(), vec!["Gamma"]);
-        // Delete clears them.
+        assert!(s.notes_documenting("Alpha").unwrap().is_empty()); // re-set dropped it
+                                                                   // Delete clears them.
         s.delete_note_code_refs(&id).unwrap();
         assert!(s.note_code_refs(&id).unwrap().is_empty());
     }

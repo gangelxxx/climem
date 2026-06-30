@@ -154,6 +154,12 @@
 `store::set_note_code_refs`/`note_code_refs`/`delete_note_code_refs`; reindex пересобирает из md
 (рядом с `set_note_slug`), `forget` чистит, `wipe_derived` стирает. См. [decisions.md](decisions.md).
 
+Авторинг якорей — два пути, сводимых `graph::note_code_anchors(note)` (frontmatter `code:` ∪ body
+`[[code:NAME]]`, dedup, order-stable; зовётся в `remember` и `reindex`): флаг `remember --code-refs`
+**или** инлайн `[[code:NAME]]` в теле. `note_edges` пропускает `code:`-wikilinks (`CODE_LINK_PREFIX`),
+чтобы они не стали note-рёбрами. Зеркало: `backlinks --symbol <name>` (`store::notes_documenting`)
+→ ноты, документирующие символ (`{id,kind,documents,preview}`) — «из символа найти доки».
+
 ## Пересборка индекса (`commands::reindex`)
 
 `reindex [--all]` собирает `store.db` из правды (`notes/*.md` + `imports/`). `Store::open`

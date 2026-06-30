@@ -86,9 +86,16 @@ pub fn scan_wikilinks(body: &str) -> Vec<String> {
     out
 }
 
+/// Prefix that marks a `[[code:NAME]]` body wiki-link as a code anchor — resolved
+/// against the code graph at recall, NOT a note link. Kept here so `note_edges`
+/// (which skips them) and `note_code_anchors` (which collects them) agree.
+pub const CODE_LINK_PREFIX: &str = "code:";
+
 /// Every `(predicate, target, source)` edge a note contributes: its authored
 /// `relations` (predicate normalized via `normalize_predicate`) plus the body's
 /// wiki-links (under the synthetic, already-normalized predicate `links_to`).
+/// A `[[code:NAME]]` wiki-link is a code anchor, not a note link, so it's skipped
+/// here (see `note_code_anchors`).
 pub fn note_edges(note: &Note) -> Vec<(String, String, &'static str)> {
     let mut edges = Vec::new();
     for (pred, target) in &note.relations {
@@ -99,9 +106,37 @@ pub fn note_edges(note: &Note) -> Vec<(String, String, &'static str)> {
         }
     }
     for target in scan_wikilinks(&note.body) {
+        if target.starts_with(CODE_LINK_PREFIX) {
+            continue; // a code anchor, harvested by note_code_anchors instead
+        }
         edges.push(("links_to".to_string(), target, "wikilink"));
     }
     edges
+}
+
+/// Every code-symbol name a note anchors to: its frontmatter `code:` field first,
+/// then any `[[code:NAME]]` in the body. Order-stable and de-duplicated (so writing
+/// the same symbol in both places stores it once). Names are case-sensitive — they
+/// match `code_symbols.name` verbatim. This is the exact set stored in
+/// `note_code_refs`, from both `remember` and `reindex`, so the two never diverge.
+pub fn note_code_anchors(note: &Note) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for name in &note.code_refs {
+        let n = name.trim();
+        if !n.is_empty() && seen.insert(n.to_string()) {
+            out.push(n.to_string());
+        }
+    }
+    for target in scan_wikilinks(&note.body) {
+        if let Some(name) = target.strip_prefix(CODE_LINK_PREFIX) {
+            let n = name.trim();
+            if !n.is_empty() && seen.insert(n.to_string()) {
+                out.push(n.to_string());
+            }
+        }
+    }
+    out
 }
 
 /// Turn a target name into a note id. An `id:<hex>` prefix forces resolution by
@@ -225,6 +260,47 @@ mod tests {
             edges[2],
             ("links_to".into(), "api-rate-limit".into(), "wikilink")
         );
+    }
+
+    #[test]
+    fn code_wikilink_is_not_a_note_edge() {
+        // `[[code:NAME]]` is a code anchor, so note_edges must NOT emit a links_to
+        // edge for it — only the real note wiki-link survives.
+        let note = Note {
+            body: "uses [[code:validate_token]] and links [[db-schema]]".into(),
+            ..Default::default()
+        };
+        let edges = note_edges(&note);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(
+            edges[0],
+            ("links_to".into(), "db-schema".into(), "wikilink")
+        );
+    }
+
+    #[test]
+    fn note_code_anchors_merges_frontmatter_and_body_deduped() {
+        let note = Note {
+            code_refs: vec!["validate_token".into(), "JwtAuth".into()],
+            // `validate_token` repeats (collapses); a labelled form and whitespace
+            // are handled; a bare `[[db-schema]]` is a note link, not an anchor.
+            body: "see [[code:validate_token]], [[code: refresh_token |refresh]], [[db-schema]]"
+                .into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            note_code_anchors(&note),
+            vec!["validate_token", "JwtAuth", "refresh_token"]
+        );
+    }
+
+    #[test]
+    fn note_code_anchors_empty_when_none() {
+        let note = Note {
+            body: "plain note, [[just-a-link]]".into(),
+            ..Default::default()
+        };
+        assert!(note_code_anchors(&note).is_empty());
     }
 
     #[test]

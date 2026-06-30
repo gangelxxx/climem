@@ -31,6 +31,8 @@ const VALUE_FLAGS: &[&str] = &[
     // graph traversal (`related`): --depth N, --predicate P (--all is boolean)
     "depth",
     "predicate",
+    // backlinks --symbol <name>: notes documenting a code symbol (doc↔code mirror)
+    "symbol",
     // graph authoring on `remember`: --slug S, --relations "p:t,p:t",
     // --code-refs "sym,sym" (anchors into the code graph, resolved at recall)
     "slug",

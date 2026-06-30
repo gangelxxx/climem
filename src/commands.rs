@@ -273,7 +273,9 @@ pub fn remember(p: &Parsed, ctx: &Ctx) -> Result<()> {
             }
         }
         let _ = store.set_note_slug(&id, slug); // make this note linkable by slug right away
-        let _ = store.set_note_code_refs(&id, &code_refs); // anchors into the code graph
+                                                // Anchors into the code graph: the --code-refs frontmatter plus any
+                                                // `[[code:NAME]]` in the body, merged and de-duped.
+        let _ = store.set_note_code_refs(&id, &graph::note_code_anchors(&note_val));
 
         // Derive the outgoing edges from --relations and the body's [[wiki-links]].
         // Best-effort: targets resolve against the notes we know about right now and
@@ -610,10 +612,40 @@ pub fn related(p: &Parsed, ctx: &Ctx) -> Result<()> {
 /// that authored an edge resolving to `<id>`, with the predicate it used. Output
 /// mirrors `related` minus `distance`/`dangling` (a backlink is always a resolved,
 /// one-hop inbound edge from a live note).
+///
+/// `backlinks --symbol <name>` is the doc↔code mirror: which NOTES document a code
+/// symbol (the reverse of `recall`'s `code_refs`). That's "code became
+/// documentation" — from a symbol, find the notes that explain it.
 pub fn backlinks(p: &Parsed, ctx: &Ctx) -> Result<()> {
     let (store, _cfg) = ctx.open()?;
-    let id = parse_id(p.arg(0))
-        .map_err(|_| AppError::with_hint("backlinks needs a note id", "cm backlinks 0a1b2c3d"))?;
+
+    // `--symbol <name>` mode: notes that document this code symbol. No note id.
+    if let Some(symbol) = p.value("symbol").filter(|s| !s.is_empty()) {
+        let limit = parse_limit(p.value("limit"), 5)?;
+        let mut printed = 0usize;
+        for nid in store.notes_documenting(symbol)? {
+            if printed >= limit {
+                break;
+            }
+            if let Some(row) = store.get(&nid)? {
+                print_line(&json!({
+                    "id": row.id,
+                    "kind": row.kind,
+                    "documents": symbol,
+                    "preview": preview(&row.body, 160),
+                }));
+                printed += 1;
+            }
+        }
+        return Ok(());
+    }
+
+    let id = parse_id(p.arg(0)).map_err(|_| {
+        AppError::with_hint(
+            "backlinks needs a note id (or --symbol <name> for docs covering a code symbol)",
+            "cm backlinks 0a1b2c3d",
+        )
+    })?;
     let limit = parse_limit(p.value("limit"), 5)?;
     let predicate = p
         .value("predicate")
@@ -854,7 +886,7 @@ fn reindex_notes(store: &Store, emb: Option<&dyn Embedder>, ctx: &Ctx) -> Result
                 &vec,
             )?;
             store.set_note_slug(&id, parsed.slug.as_deref())?;
-            store.set_note_code_refs(&id, &parsed.code_refs)?;
+            store.set_note_code_refs(&id, &graph::note_code_anchors(&parsed))?;
             store.file_state_set(&rel, "note", &id, &hash, mtime_secs(&path))?;
             changed += 1;
             changed_notes.push((id, parsed));

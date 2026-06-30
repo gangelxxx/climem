@@ -179,7 +179,8 @@ COMMANDS (full reference)
                    when the symbol is gone — so a doc can show whether its code still
                    exists. Anchored by NAME, so it survives line edits.
     Inside the text you may write [[name]] to link to another note (name is its
-    slug, or id:<hex>).
+    slug, or id:<hex>), or [[code:<symbol>]] to anchor it to a code symbol inline
+    (same as listing it in --code-refs).
     PRINTS:  {"id":"<hex>"}   <- save this id; it names the note's file.
     Example:
       echo "Decided: auth uses JWT, refresh token lasts 30 days." \
@@ -272,12 +273,18 @@ COMMANDS (full reference)
   backlinks  — the reverse of related: which notes link TO this one.
   ---------
     cm backlinks <id> [--predicate P] [--limit N]
+    cm backlinks --symbol <name> [--limit N]
     The graph is directed: `related <id>` shows what <id> points at; `backlinks
     <id>` shows who points at <id>. One hop. Each line:
       {"id","kind","predicate","preview"}.
     --predicate P  only count links made with predicate P.
     --limit N      max backlinks to return (default 5).
+    --symbol <name>  the doc↔code mirror: which NOTES document this code symbol
+                     (the reverse of recall's code_refs). Each line:
+                       {"id","kind","documents":"<name>","preview"}.
+                     "from a symbol, find the docs that explain it."
     Example:  cm backlinks 0a1b2c3d
+              cm backlinks --symbol validate_token
 
   forget  — delete one note (the file and its search entry).
   ------
