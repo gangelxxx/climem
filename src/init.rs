@@ -1166,8 +1166,11 @@ fn cm_guide(exe: &str) -> String {
          {exe} recall \"how does authentication work\" --limit 5\n\
          → {{\"id\":\"0a1b2c3d\",\"kind\":\"note\",\"body\":\"Auth uses JWT; refresh lasts 30 days.\"}}\n\
          ```\n\
-         Each line is one match, best first. Useful flags: `--limit N` (how many),\n\
-         `--tag T` (only that tag), `--fields id,body` (only these fields).\n\
+         Each line is one match, best first. A short note prints its whole `body`; a\n\
+         long one comes back as `preview`+`chars` (a budgeted summary) — read that\n\
+         first, and `{exe} get <id>` only when you need the rest. Useful flags:\n\
+         `--limit N` (how many), `--full` (whole bodies, no preview),\n\
+         `--budget C` (cap each body at C chars), `--tag T` (only that tag).\n\
          \n\
          **Remember after you decide.** Save a fact for next time (body on stdin):\n\
          ```\n\
@@ -1383,6 +1386,7 @@ fn entry_point_block(exe_display: &str) -> String {
          ### MEMORY — facts, decisions, docs\n\
          - BEFORE answering a project question, recall first:\n\
          `{exe} recall \"<topic>\"` → `{{\"id\":\"0a1b2c3d\",\"kind\":\"note\",\"body\":\"…\"}}` per match.\n\
+         A long match comes back as `preview`+`chars` instead of `body`; `{exe} get <id>` for the full text.\n\
          - AFTER a decision worth keeping, save it (the text comes from STDIN, never an arg):\n\
          `echo \"<the fact>\" | {exe} remember` → `{{\"id\":\"0a1b2c3d\"}}`.\n\
          - Don't re-read large docs in full — pull the relevant slice via `recall`.\n\n\

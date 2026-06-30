@@ -24,6 +24,9 @@ pub const RECALL_FIELDS: &[&str] = &[
     "graph",
     "created_at",
     "preview",
+    // Full character length of the body — the marker that travels with a
+    // budget-truncated `preview` so a caller knows there's more to `cm get`.
+    "chars",
 ];
 
 /// Round a similarity scalar to 4 decimals, so the JSON doesn't wobble on f32 noise.
@@ -46,13 +49,21 @@ pub fn note_value(row: &NoteRow) -> Value {
 
 /// Shape one `recall` hit as a lean JSON object (plan E1).
 ///
-/// - With `fields = Some(list)` you get exactly those fields and nothing else.
-/// - With `fields = None` you get the default set: `id, kind, body`, plus
-///   `tags`/`origin`/`source` only when they're actually present, plus
-///   `score/fts/vector` only when `explain` is on.
+/// - With `fields = Some(list)` you get exactly those fields and nothing else
+///   (the explicit projection bypasses `body_budget` — `body` means the whole body).
+/// - With `fields = None` you get the default set: `id, kind`, then either `body`
+///   (whole) or, when `body_budget = Some(n)` and the body is longer than `n`
+///   chars, a `preview` (truncated to `n`) plus `chars` (the full length) instead —
+///   the preview-first default that keeps the main read path lean. Add
+///   `tags`/`origin`/`source` only when present, plus `score/fts/vector/graph`
+///   only when `explain` is on.
 ///
-/// The point of dropping the debug scalars and the empty/null fields by default
-/// is to keep each recall row small.
+/// The point of dropping the debug scalars, the empty/null fields, and the long
+/// tail of big bodies by default is to keep each recall row small.
+// The score channels (score/fts/vector/graph) are distinct f32s a caller already
+// holds as separate locals; bundling them into a struct just to dodge the arg
+// count would add ceremony at every call site for no clarity. Plan E1.
+#[allow(clippy::too_many_arguments)]
 pub fn recall_value(
     row: &NoteRow,
     score: f32,
@@ -61,6 +72,7 @@ pub fn recall_value(
     graph: f32,
     fields: Option<&[String]>,
     explain: bool,
+    body_budget: Option<usize>,
 ) -> Value {
     let mut map = serde_json::Map::new();
     match fields {
@@ -74,7 +86,7 @@ pub fn recall_value(
         None => {
             map.insert("id".into(), json!(row.id));
             map.insert("kind".into(), json!(row.kind));
-            map.insert("body".into(), json!(row.body));
+            insert_body(&mut map, &row.body, body_budget);
             let tags = split_tags(&row.tags);
             if !tags.is_empty() {
                 map.insert("tags".into(), json!(tags));
@@ -94,6 +106,27 @@ pub fn recall_value(
         }
     }
     Value::Object(map)
+}
+
+/// Insert the body into a default-shape recall row under a per-result budget.
+///
+/// Within budget (or no budget): the whole body lands under `body`, so short
+/// remembered facts are byte-for-byte what they were before this knob existed.
+/// Over budget: `body` is dropped in favor of `preview` (truncated to the budget,
+/// ellipsis-terminated) and `chars` (the full length) — a self-describing signal
+/// that there's more, fetchable with `cm get <id>`. The key change (`body` →
+/// `preview`) is deliberate: a caller that reads `body` notices its absence rather
+/// than silently acting on a truncated value.
+fn insert_body(map: &mut serde_json::Map<String, Value>, body: &str, budget: Option<usize>) {
+    match budget {
+        Some(max) if body.chars().count() > max => {
+            map.insert("preview".into(), json!(preview(body, max)));
+            map.insert("chars".into(), json!(body.chars().count()));
+        }
+        _ => {
+            map.insert("body".into(), json!(body));
+        }
+    }
 }
 
 /// Look up one recall field by name (`None` if the name isn't one we know).
@@ -118,6 +151,7 @@ fn field_value(
         "graph" => json!(round4(graph)),
         "created_at" => json!(row.created_iso),
         "preview" => json!(preview(&row.body, 160)),
+        "chars" => json!(row.body.chars().count()),
         _ => return None,
     })
 }
@@ -283,7 +317,16 @@ mod tests {
     #[test]
     fn recall_value_default_is_lean_and_omits_empty_nulls() {
         // tags empty, origin/source null -> only id/kind/body remain (no debug scalars).
-        let v = recall_value(&row("hi", "", None, None), 0.5, 0.3, 0.2, 0.0, None, false);
+        let v = recall_value(
+            &row("hi", "", None, None),
+            0.5,
+            0.3,
+            0.2,
+            0.0,
+            None,
+            false,
+            None,
+        );
         let obj = v.as_object().unwrap();
         assert_eq!(
             obj.keys().cloned().collect::<Vec<_>>(),
@@ -317,6 +360,7 @@ mod tests {
             0.0,
             None,
             false,
+            None,
         );
         assert_eq!(v["tags"], json!(["a", "b"]));
         assert_eq!(v["source"], json!("src"));
@@ -335,6 +379,7 @@ mod tests {
             0.0123,
             None,
             true,
+            None,
         );
         assert!((v["score"].as_f64().unwrap() - 0.1235).abs() < 1e-4); // round4(0.12346)
         assert!((v["fts"].as_f64().unwrap() - 0.1).abs() < 1e-4);
@@ -353,6 +398,7 @@ mod tests {
             0.0,
             Some(&fields),
             false,
+            None,
         );
         let obj = v.as_object().unwrap();
         // Exactly the requested keys (alphabetical in output), nothing else.
@@ -370,9 +416,71 @@ mod tests {
             0.0,
             Some(&fields),
             false,
+            None,
         );
         assert_eq!(v["preview"], json!("a b c"));
         assert!((v["score"].as_f64().unwrap() - 0.4242).abs() < 1e-4);
+    }
+
+    #[test]
+    fn recall_value_budget_passes_short_body_whole() {
+        // A body within budget is printed whole under `body` — no preview, no chars.
+        let v = recall_value(
+            &row("short fact", "", None, None),
+            0.5,
+            0.3,
+            0.2,
+            0.0,
+            None,
+            false,
+            Some(100),
+        );
+        assert_eq!(v["body"], json!("short fact"));
+        assert!(v.get("preview").is_none());
+        assert!(v.get("chars").is_none());
+    }
+
+    #[test]
+    fn recall_value_budget_truncates_long_body_to_preview() {
+        // Over budget: `body` is dropped for `preview` (budget+ellipsis) plus the
+        // full `chars` length, so the caller knows to `cm get` for the rest.
+        let body: String = "x".repeat(600);
+        let v = recall_value(
+            &row(&body, "", None, None),
+            0.5,
+            0.3,
+            0.2,
+            0.0,
+            None,
+            false,
+            Some(100),
+        );
+        assert!(
+            v.get("body").is_none(),
+            "over-budget body must not be printed whole"
+        );
+        let preview = v["preview"].as_str().unwrap();
+        assert_eq!(preview.chars().count(), 101); // 100 + ellipsis
+        assert!(preview.ends_with('…'));
+        assert_eq!(v["chars"], json!(600));
+    }
+
+    #[test]
+    fn recall_value_no_budget_keeps_whole_body() {
+        // `--full` / `--budget 0` -> body_budget None -> whole body regardless of size.
+        let body: String = "y".repeat(600);
+        let v = recall_value(
+            &row(&body, "", None, None),
+            0.5,
+            0.3,
+            0.2,
+            0.0,
+            None,
+            false,
+            None,
+        );
+        assert_eq!(v["body"].as_str().unwrap().chars().count(), 600);
+        assert!(v.get("preview").is_none());
     }
 
     #[test]

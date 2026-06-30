@@ -210,7 +210,7 @@ A note's **id is a short hex string** (e.g. `0a1b2c3d`) — and it's also the fi
 | `cm deinit <path> [--name N] [--yes]` | **Full rollback of `init`** — leaves only `cm` + `config.json`. Strips the pointer blocks from `CLAUDE.md`/`AGENTS.md`/… (and removes an `AGENTS.md`/`CM_GUIDE.md` init created); **restores every imported doc** to its original path if free, else under `<dir>/climem/<file>` (docs added later via `cm import` go to `docs/climem/`); restores the root `.gitignore` to its pre-init bytes (or deletes it if init created it); removes the data folder (`memory/`) **entirely**. Manifest-driven; with no manifest it falls back to the `imports/` sidecars (restoring by name into `docs/climem/`) and strips only its own `.gitignore` block. Finds the data folder via config's `data_dir` (or `--name`). Asks first; `--yes` skips. |
 | `… \| cm remember [--tags a,b] [--source S] [--slug S] [--relations "p:t,p:t"]` | Write a note. Body from **stdin** → `notes/<id>.md`, then index. `--slug`/`--relations` feed the graph. Prints `{"id":"<hex>"}`. |
 | `… \| cm feedback [--tags a,b]` · `cm feedback --list [--recent N]` | Let the agent that *uses* cm report what's missing or could be better. Body from **stdin** (like `remember`) → an ordinary note tagged `cm-feedback`, stamped with the cm version, saved into **this project's** memory; prints `{"id":"<hex>"}`. `--list` prints the feedback gathered so far (newest first). Review anytime with `cm feedback --list` or `cm recall "<topic>" --tag cm-feedback`. |
-| `cm recall "<query>" [--limit N] [--explain] [--fields …] [--tag T] [--origin-prefix F] [--min-score X] [--related <id>]` | Hybrid search (FTS5 + vector, plus optional graph proximity via `--related <id>`, fused via RRF). Returns lean JSONL sorted by relevance. `--related` is off unless `search.hybrid_weights.graph` is non-zero. |
+| `cm recall "<query>" [--limit N] [--budget C \| --full] [--explain] [--fields …] [--tag T] [--origin-prefix F] [--min-score X] [--related <id>]` | Hybrid search (FTS5 + vector, plus optional graph proximity via `--related <id>`, fused via RRF). Returns lean JSONL sorted by relevance, **preview-first**: a long body comes back as `preview`+`chars` (cap `search.recall_body_chars`, default 500) unless `--full`/`--budget 0`. `--related` is off unless `search.hybrid_weights.graph` is non-zero. |
 | `cm get <id>` | Fetch one record in full. |
 | `cm list [--recent N]` | List the most recent records (body shown as a preview). |
 | `cm related <id> [--depth D] [--predicate P] [--limit N] [--fields …]` | Graph neighbours this note points at (frontmatter `relations` + `[[wikilinks]]`). Dangling targets come back as `{"dangling":true,…}`. |
@@ -234,19 +234,28 @@ Both call styles work: subcommands (`cm recall …`) and a Windows-flavoured lea
 ## Lean recall output
 
 By default `recall` prints a **lean** line — just what a consumer usually needs: `id`, `kind`,
-`body`, plus `tags`/`origin`/`source` when they're set (empty/null fields are dropped). The
+the body, plus `tags`/`origin`/`source` when they're set (empty/null fields are dropped). The
 debug relevance numbers are hidden, which saves tokens without hurting the results.
 
+**Preview-first body.** A short note prints its whole `body`; a long one (an imported doc chunk,
+say) comes back as `preview` (the first 500 chars) plus `chars` (its full length) *instead of*
+`body` — so the everyday read path stays small and you only pay for the long tail when you ask
+for it. The cap is `search.recall_body_chars` (default 500); `--budget C` overrides it per call,
+and `--full` (or `--budget 0`) prints whole bodies. When you see `preview`+`chars`, the full
+text is one `cm get <id>` away.
+
 ```bash
-cm recall "auth" --limit 5             # lean default (N defaults to 5)
+cm recall "auth" --limit 5             # lean, preview-first default (N defaults to 5)
+cm recall "auth" --budget 300          # cap each body at 300 chars
+cm recall "auth" --full                # whole bodies, no preview
 cm recall "auth" --explain             # + score/fts/vector/graph (each channel's RRF contribution)
-cm recall "auth" --fields id,body      # exactly these fields
+cm recall "auth" --fields id,body      # exactly these fields (bypasses the budget)
 cm recall "schema" --tag spec          # only notes carrying a tag
 cm recall "schema" --origin-prefix arch.md   # only chunks from a given file
 cm recall "schema" --min-score 0.01    # drop weak candidates
 ```
 
-`--fields` understands: `id,kind,body,tags,origin,source,score,fts,vector,graph,created_at,preview`.
+`--fields` understands: `id,kind,body,tags,origin,source,score,fts,vector,graph,created_at,preview,chars`.
 The full record is always one `cm get <id>` away.
 
 ---

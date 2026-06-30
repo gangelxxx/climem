@@ -410,12 +410,29 @@ pub fn recall(p: &Parsed, ctx: &Ctx) -> Result<()> {
         Some(s) if !s.is_empty() => Some(parse_fields(s, output::RECALL_FIELDS)?),
         _ => None,
     };
+    // Preview-first body budget (token-efficiency): big bodies come back as a
+    // `preview` + `chars` instead of the whole `body`, so the main read path stays
+    // lean. `--full` (or `--budget 0`) prints whole bodies; `--budget N` caps at N
+    // chars; otherwise the config default applies.
+    let body_budget = if p.has("full") {
+        None
+    } else {
+        parse_budget(p.value("budget"), cfg.search.recall_body_chars)?
+    };
     // `--explain` only adds the score scalars in the default (no --fields) shape;
     // with an explicit --fields list it would be a silent no-op, so say so.
     if explain && fields.is_some() {
         eprintln!(
             "warning: --explain has no effect with --fields; \
              add score,fts,vector,graph to --fields to see those scalars"
+        );
+    }
+    // Same story for the body budget: with an explicit projection, `body`/`preview`
+    // are whatever the caller listed, so --budget/--full don't apply.
+    if fields.is_some() && (p.has("full") || p.value("budget").is_some()) {
+        eprintln!(
+            "warning: --budget/--full have no effect with --fields; \
+             the projection controls body vs preview directly"
         );
     }
     let opts = RecallOpts {
@@ -450,6 +467,7 @@ pub fn recall(p: &Parsed, ctx: &Ctx) -> Result<()> {
             h.graph,
             fields.as_deref(),
             explain,
+            body_budget,
         ));
     }
     Ok(())
@@ -1650,6 +1668,24 @@ fn parse_limit(arg: Option<&str>, default: usize) -> Result<usize> {
     }
 }
 
+/// Resolve the per-result body budget for `recall` from `--budget`:
+/// absent → `Some(default)` (the config default, preview-first); `--budget 0` →
+/// `None` (no cap, whole bodies — same as `--full`); `--budget N` → `Some(N)`.
+fn parse_budget(arg: Option<&str>, default: usize) -> Result<Option<usize>> {
+    match arg {
+        None | Some("") => Ok(Some(default)),
+        Some(s) => {
+            let n = s.parse::<usize>().map_err(|_| {
+                AppError::with_hint(
+                    format!("--budget must be a number of characters, got '{s}'"),
+                    "cm recall \"topic\" --budget 300   (or --full for whole bodies)",
+                )
+            })?;
+            Ok((n != 0).then_some(n))
+        }
+    }
+}
+
 /// Parse a `--relations "pred:target, pred:target"` string into edge pairs. We
 /// split items on commas, and each item on its FIRST colon, so an `id:<hex>`
 /// target keeps its prefix. Anything malformed (no colon, or a blank side) is
@@ -1837,6 +1873,20 @@ mod tests {
         let err = parse_limit(Some("x"), 8).unwrap_err();
         assert!(err.msg.contains("limit must be a number"));
         assert!(err.hint.is_none());
+    }
+
+    #[test]
+    fn parse_budget_default_zero_value_and_invalid() {
+        // Absent / empty -> the config default (preview-first stays on).
+        assert_eq!(parse_budget(None, 500).unwrap(), Some(500));
+        assert_eq!(parse_budget(Some(""), 500).unwrap(), Some(500));
+        // Explicit N caps at N; 0 means "no cap" (whole bodies, like --full).
+        assert_eq!(parse_budget(Some("300"), 500).unwrap(), Some(300));
+        assert_eq!(parse_budget(Some("0"), 500).unwrap(), None);
+        // Non-numbers fail with a self-healing hint.
+        let err = parse_budget(Some("big"), 500).unwrap_err();
+        assert!(err.msg.contains("--budget must be a number"));
+        assert!(err.hint.is_some());
     }
 
     #[test]

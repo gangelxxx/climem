@@ -25,6 +25,9 @@ const VALUE_FLAGS: &[&str] = &[
     "tag",
     "origin-prefix",
     "min-score",
+    // recall preview-first body budget: cap each hit's body at N chars
+    // (`--full` is boolean and stays out of VALUE_FLAGS).
+    "budget",
     // graph traversal (`related`): --depth N, --predicate P (--all is boolean)
     "depth",
     "predicate",

@@ -79,6 +79,15 @@ pub struct Search {
     /// follow every predicate.
     #[serde(default)]
     pub graph_predicate: String,
+    /// Default per-result body budget for `recall`, in characters. A hit whose body
+    /// fits within this is printed whole as `body`; a longer one is summarized to a
+    /// `preview` (plus `chars`, the full length) so the agent can `cm get <id>` for
+    /// the rest. This is the preview-first default that keeps the main read path
+    /// lean; `recall --budget N` overrides it per call and `--budget 0` / `--full`
+    /// disables it. Short remembered facts (the common case) sit well under it and
+    /// are unaffected.
+    #[serde(default = "default_recall_body_chars")]
+    pub recall_body_chars: usize,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -152,6 +161,12 @@ fn default_rrf_k() -> usize {
 fn default_graph_depth() -> usize {
     2
 }
+fn default_recall_body_chars() -> usize {
+    // ~80–90 words: a few sentences. Below this, remembered facts print whole; a
+    // 200-word imported chunk (the chunking default) is summarized to roughly a
+    // third. Tune via `cm config set search.recall_body_chars N`.
+    500
+}
 fn half() -> f32 {
     0.5
 }
@@ -186,6 +201,7 @@ impl Default for Search {
             rrf_k: default_rrf_k(),
             graph_depth: default_graph_depth(),
             graph_predicate: String::new(),
+            recall_body_chars: default_recall_body_chars(),
         }
     }
 }
@@ -374,6 +390,7 @@ mod tests {
         assert_eq!(c.search.rrf_k, 60);
         assert_eq!(c.search.graph_depth, 2); // recall --related explores 2 hops
         assert!(c.search.graph_predicate.is_empty()); // no predicate filter by default
+        assert_eq!(c.search.recall_body_chars, 500); // preview-first per-result body cap
         assert_eq!(c.chunking.max_tokens, 200);
         assert_eq!(c.chunking.overlap, 32);
         assert_eq!(c.version, 2);

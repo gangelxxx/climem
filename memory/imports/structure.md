@@ -138,6 +138,12 @@
 Ключи в JSON — в алфавитном порядке (serde_json без `preserve_order`), байт-стабильно.
 Полная запись — всегда `get <id>` (там форма не меняется).
 
+**Preview-first бюджет тела** (`output::insert_body`): тело длиннее per-result бюджета выводится
+как `preview`+`chars` вместо `body` — главный токен-сберегатель на горячем пути чтения (короткие
+заметки проходят целиком). Бюджет = `search.recall_body_chars` (дефолт 500); `--budget N`
+перебивает (`commands::parse_budget`: `0`→без обрезки), `--full` = без обрезки. С `--fields`
+бюджет игнорируется (явная проекция). `chars` — известное поле в `RECALL_FIELDS`.
+
 ## Пересборка индекса (`commands::reindex`)
 
 `reindex [--all]` собирает `store.db` из правды (`notes/*.md` + `imports/`). `Store::open`

@@ -199,16 +199,24 @@ COMMANDS (full reference)
 
   recall  — search notes by topic. THIS IS THE MAIN READ COMMAND.
   ------
-    cm recall "<query>" [--limit N] [--explain] [--fields a,b,c]
-                        [--tag T] [--origin-prefix F] [--min-score X]
-                        [--related <id>]
+    cm recall "<query>" [--limit N] [--budget C | --full] [--explain]
+                        [--fields a,b,c] [--tag T] [--origin-prefix F]
+                        [--min-score X] [--related <id>]
     Searches by keywords AND by meaning at once, blends the two, and prints the
     best matches as JSONL, best first. You do NOT need to understand the
     blending; just read the printed lines.
     --limit N        how many results (default 5).
-    --fields a,b,c   print ONLY these fields. Valid names:
+    --budget C       cap each result's body at C characters (default 500). A short
+                     note prints whole as "body"; a longer one comes back as
+                     "preview" (the first C chars) plus "chars" (its full length) —
+                     fetch the rest with `cm get <id>`. This preview-first default
+                     keeps the read path lean; tune it with
+                       cm config set search.recall_body_chars C
+    --full           print whole bodies, no preview (same as --budget 0).
+    --fields a,b,c   print ONLY these fields (overrides --budget/--full; "body"
+                     means the whole body). Valid names:
                        id, kind, body, tags, origin, source,
-                       score, fts, vector, graph, created_at, preview
+                       score, fts, vector, graph, created_at, preview, chars
     --explain        also print the relevance numbers (score/fts/vector/graph).
     --tag T          only notes carrying tag T.
     --origin-prefix F  only chunks whose source file path starts with F.
@@ -220,8 +228,10 @@ COMMANDS (full reference)
                      How far it reaches (default 2 hops) and an optional predicate
                      filter live in config too (search.graph_depth,
                      search.graph_predicate).
-    DEFAULT OUTPUT per line: {"id","kind","body"} plus tags/origin/source when
-    the note has them. Empty fields are omitted to save space.
+    DEFAULT OUTPUT per line: {"id","kind","body"} for a short note, or
+    {"id","kind","preview","chars"} when the body is over budget; plus
+    tags/origin/source when the note has them. Empty fields are omitted to save
+    space. When you see "preview"+"chars", `cm get <id>` returns the full body.
     Example:  cm recall "how does authentication work" --limit 5
 
   get  — fetch ONE note in full, by id.
