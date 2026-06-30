@@ -1096,8 +1096,12 @@ fn collect_code_query(
         // The hubs are the architecture's skeleton, so this is the slice an agent
         // should read first, at a fraction of a full dump's tokens. `--all` lifts the
         // cap; `--limit N` resizes it; `--kind`/`--tests` narrow either.
+        // `--limit 0` means "no cap" (the whole ranking), mirroring `--budget 0` and
+        // `--all` — without this it would be a literal SQL `LIMIT 0` (empty result),
+        // which then trips the auto-re-map self-heal into a needless full re-index.
         let limit = parse_limit(p.value("limit"), 30)?;
-        for (s, degree) in store.code_hubs(kind, tests, Some(limit))? {
+        let cap = (limit != 0).then_some(limit);
+        for (s, degree) in store.code_hubs(kind, tests, cap)? {
             out.push(code_hub_value(&s, degree));
         }
     }
@@ -1689,11 +1693,13 @@ fn parse_limit(arg: Option<&str>, default: usize) -> Result<usize> {
 }
 
 /// Resolve the per-result body budget for `recall` from `--budget`:
-/// absent → `Some(default)` (the config default, preview-first); `--budget 0` →
-/// `None` (no cap, whole bodies — same as `--full`); `--budget N` → `Some(N)`.
+/// absent → the config `default` (preview-first); `--budget N` → `Some(N)`. A zero
+/// from EITHER source → `None` (no cap, whole bodies — same as `--full`), so a
+/// configured `search.recall_body_chars 0` reads as "previews off" exactly like
+/// `--budget 0`, instead of collapsing every body to a lone ellipsis.
 fn parse_budget(arg: Option<&str>, default: usize) -> Result<Option<usize>> {
     match arg {
-        None | Some("") => Ok(Some(default)),
+        None | Some("") => Ok((default != 0).then_some(default)),
         Some(s) => {
             let n = s.parse::<usize>().map_err(|_| {
                 AppError::with_hint(
@@ -1900,6 +1906,8 @@ mod tests {
         // Absent / empty -> the config default (preview-first stays on).
         assert_eq!(parse_budget(None, 500).unwrap(), Some(500));
         assert_eq!(parse_budget(Some(""), 500).unwrap(), Some(500));
+        // A zero config default reads as "previews off" (no cap), same as --budget 0.
+        assert_eq!(parse_budget(None, 0).unwrap(), None);
         // Explicit N caps at N; 0 means "no cap" (whole bodies, like --full).
         assert_eq!(parse_budget(Some("300"), 500).unwrap(), Some(300));
         assert_eq!(parse_budget(Some("0"), 500).unwrap(), None);
